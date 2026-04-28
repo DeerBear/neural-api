@@ -166,6 +166,139 @@ The KAN attention normaliser is composed of five interacting components. Each is
 - One `N`-sized scratch buffer for evaluation (shared across heads at runtime if memory is tight).
 - Negligible compared to Q/K/V projection weights, which dominate per-layer memory.
 
+### 5.2 Mechanism #1 — GM-Based Coefficient Rebalance
+
+The central regulator of the spline. Runs every inference step on every head, after the local learning rule (§6.4) has applied its update. Iterates to fixed point with a hard safety cap on iterations.
+
+#### 5.2.1 Window
+
+For each coefficient `c_i`, its **window** is the set of coefficients whose B-spline supports overlap `c_i`'s support. On a uniform grid with order-`k` basis this is the `2k+1` coefficients centred on `c_i` (clamped near boundaries). Groups self-form from the basis structure; no manual group definition is required.
+
+The window is the unit on which all of mechanism #1's invariants are defined.
+
+#### 5.2.2 Window Statistic — Geometric Mean
+
+For each window, compute:
+```
+g = exp( mean_{j ∈ window}( log |c_j| ) )
+```
+
+Computed in log-space for numerical safety. No `+ε` floor is required because the low-lift rule (§5.2.4) keeps `|c_j|` strictly bounded away from zero.
+
+The geometric mean is the right statistic for a multiplicative regime: it is scale-equivariant (`GM(α·X) = α·GM(X)`), it is naturally robust to a single dominating outlier (the GM is barely affected by extreme single values, unlike the arithmetic mean), and it is the correct centre of mass under the GM=1 gauge (§5.3).
+
+#### 5.2.3 High Clip
+
+If `|c_i| > 3 · g`:
+
+1. Clip the offending coefficient: `c_i ← sign(c_i) · 3 · g`.
+2. Compute the multiplicative excess: `r = |c_i_old| / |c_i_new| > 1`.
+3. Redistribute `r` across the remaining `N−1 = 2k` window coefficients by multiplicative factors `f_j` satisfying:
+   ```
+   c_j ← c_j · f_j        for j ≠ i
+   Π_{j ≠ i} f_j  =  r
+   ```
+   The factors are positive (sign-preserving). The exact distribution rule depends on the share mode (§5.2.5).
+
+By construction, the **window product `Π_{j ∈ window} |c_j|` is preserved exactly** by this operation:
+```
+Π_new = (|c_i| / r) · (Π_{j ≠ i} |c_j| · f_j)
+      = (|c_i| / r) · r · Π_{j ≠ i} |c_j|
+      = Π_old
+```
+
+#### 5.2.4 Low Lift (Productivity Rule)
+
+If `|c_i| < g / 2`:
+
+1. Lift the deficient coefficient toward the window's GM: `c_i ← sign(c_i) · g`.
+2. Compute the multiplicative deficit: `q = |c_i_new| / |c_i_old| > 1`.
+3. Shrink the remaining window coefficients by multiplicative factors `f_j` satisfying:
+   ```
+   c_j ← c_j · f_j        for j ≠ i
+   Π_{j ≠ i} f_j  =  1 / q
+   ```
+
+Same product-preservation property as the high clip.
+
+**Threshold rationale.** The low threshold is `g / 2`, not the symmetric `g / 3`. The asymmetry is intentional: the low-lift rule is doing **productivity** work (no dead weight), not merely numerical safety. Keeping every coefficient contributing maximises the per-head representational budget, which makes the head squaring (§5.5) trigger a meaningful signal of genuine capacity demand rather than wasted-budget noise. See §5.5 for the coupling.
+
+#### 5.2.5 Share Rule for Redistribution
+
+The factors `f_j` are computed as `f_j = r^{s_j}` (high clip) or `f_j = (1/q)^{s_j}` (low lift), where the **share weights `s_j` sum to 1** over the redistributed coefficients.
+
+Two share rules are supported, controlled per-event:
+
+- **Proportional:** `s_j ∝ |c_j| / Σ_{k ≠ i} |c_k|`. Larger neighbours absorb more growth (high-clip) or shrinkage (low-lift).
+- **InverseProportional:** `s_j ∝ (1 / |c_j|) / Σ_{k ≠ i} (1 / |c_k|)`. Smaller neighbours absorb more.
+
+Two flags select rules independently:
+```
+HighClipShare ∈ { Proportional, InverseProportional, Auto }
+LowLiftShare  ∈ { Proportional, InverseProportional, Auto }
+```
+
+##### Mode taxonomy and stability
+
+| Combination | Name | High-clip behaviour | Low-lift behaviour | Stability |
+|---|---|---|---|---|
+| Prop, Prop | Mode A — *preserve shape* | Big neighbours grow more (creates outliers) | Big neighbours shrink more (flattens) | Mixed: bad on high-clip, good on low-lift |
+| Inv, Inv | Mode B — *reverse* | Small neighbours grow more (flattens) | Small neighbours shrink more (creates new zeros) | Mixed: good on high-clip, bad on low-lift |
+| Inv, Prop | **Mode C — *always-flatten*** | Flattens (good half of B) | Flattens (good half of A) | **Stable; converges fast** |
+| Prop, Inv | Mode D — *anti-flatten* | Creates outliers + creates zeros | — | **Pathological; oscillates. Excluded.** |
+
+Mode C isolates the stabilising half of each pure mode and is strictly the safest. Mode A is useful when sharpness preservation is desired and clip pressure is low. Mode B is rarely useful in isolation. Mode D must never be selected.
+
+##### Auto mode (default for both flags)
+
+`Auto` selects the mode based on the layer's current `clip_rate` (defined in §5.5):
+
+```
+if clip_rate < τ_calm:                          -- e.g. 2 %
+    HighClipShare := Proportional               -- Mode A: preserve shape
+    LowLiftShare  := Proportional
+elif clip_rate > τ_stressed:                    -- e.g. 10 %
+    HighClipShare := InverseProportional        -- Mode C: always-flatten
+    LowLiftShare  := Proportional
+else:
+    -- hysteresis band: keep current mode
+```
+
+Mode D is structurally excluded by the Auto logic.
+
+#### 5.2.6 Cascade to Fixed Point
+
+After processing all coefficients in one sweep, a coefficient that was a *recipient* of redistribution may now itself violate the high-clip or low-lift threshold (because its window's `g` has shifted). Mechanism #1 therefore iterates:
+
+```
+for iter in 1 .. max_iter:
+    fired = 0
+    for i in 1 .. N:
+        recompute g for c_i's window
+        if |c_i| > 3·g: high-clip; fired += 1
+        elif |c_i| < g/2: low-lift; fired += 1
+    if fired == 0: break       -- fixed point reached
+```
+
+The cascade is guaranteed to reduce total per-window deviation from the GM in the long-run average (the share rule choice in Mode C makes each step variance-reducing). The hard cap `max_iter = 16` is a safety guard against pathological inputs; in practice the cascade typically converges in 1–3 iterations.
+
+#### 5.2.7 Counters Updated
+
+Each invocation of mechanism #1 updates two counters used elsewhere in the spec:
+
+- `clip_rate` (per layer): exponential moving average of the fraction of coefficients firing clip-or-lift in the most recent sweep. Used by Auto mode (§5.2.5) and by head squaring (§5.5).
+- `clip_count_total` (per head, per phase): cumulative count of clips and lifts since checkpoint load. Diagnostic only.
+
+#### 5.2.8 Invariants Maintained
+
+After each invocation of mechanism #1, on every head:
+
+- **(M1-1)** Per-window product: `Π_{j ∈ window} |c_j|` is unchanged from before the sweep, up to floating-point tolerance.
+- **(M1-2)** Sign of every coefficient is unchanged.
+- **(M1-3)** No coefficient is below `g/2` or above `3·g` of its own window's `g`, after cascade termination.
+- **(M1-4)** Scale-equivariance: applying mechanism #1 to coefficients `(c_j)` then multiplying by `α > 0` produces the same result as multiplying by `α` first then applying mechanism #1.
+
+
 
 
 
