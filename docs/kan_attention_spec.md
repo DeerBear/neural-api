@@ -376,6 +376,141 @@ After step 7 of the per-inference pipeline (§7), on every head:
 - **(GM-2)** The forward attention weights computed before and after renormalisation are bit-identical (up to FP reordering).
 - **(GM-3)** Every coefficient sign is preserved.
 
+### 5.4 Multi-Head Dynamics — Head Squaring
+
+#### 5.4.1 Premise — Each Head Is a Bounded Budget
+
+After mechanism #1 + GM=1 gauge, each head's coefficients live in a bounded interval (approximately `[1/6, 6]` in absolute value, depending on window size). The spline `φ` constructed from those coefficients can express only patterns that fit within this **multiplicatively balanced budget**:
+
+- Cannot have all coefficients large.
+- Cannot have all coefficients tiny.
+- Must distribute "strength" unevenly with geometric balance around 1.
+
+If the data calls for an attention pattern that cannot fit within one head's budget — for example, multiple sharp peaks across distinct score regions, each requiring high-magnitude coefficients — the head will repeatedly bump against mechanism #1's clip thresholds. **Head squaring is the relief valve: when one head's budget saturates, allocate more heads.**
+
+#### 5.4.2 Allocation — Pre-Allocate, Mask the Rest
+
+At layer construction:
+
+```
+H_max := ⌊ embedding_dim / 2 ⌋    -- architectural ceiling: minimum 2 channels per head
+ActiveHeads := 2                  -- specification-mandated initial value
+```
+
+All `H_max` heads are **physically allocated** at construction time (coefficients, RNG state, counters). Heads with index `≥ ActiveHeads` are **inactive**:
+
+- Their KAN coefficients are not updated.
+- Their forward contribution is **masked to zero** in the multi-head concat step.
+- They consume memory but no meaningful compute.
+
+Pre-allocation eliminates runtime tensor resize, structural network mutation, and the entire class of bugs that come with growing data structures during inference. Squaring is implemented as a single integer assignment plus the per-head copy/perturb of §5.4.4.
+
+#### 5.4.3 Squaring Trigger
+
+Per layer, two counters drive the trigger:
+
+- `clip_rate_ema`: per-layer EMA of the fraction of all coefficients (across all *active* heads) that fired clip-or-lift in the most recent mechanism-#1 sweep.
+- `consecutive_high_sweeps`: count of consecutive sweeps where `clip_rate_ema > τ_squaring`.
+
+Trigger condition:
+
+```
+if ActiveHeads < H_max
+   and consecutive_high_sweeps ≥ K_squaring:
+       fire_squaring()
+       consecutive_high_sweeps := 0
+```
+
+Defaults: `τ_squaring = 0.10` (10 %), `K_squaring = 64` consecutive sweeps. The latter prevents single-batch noise from triggering squaring.
+
+#### 5.4.4 The Squaring Operation
+
+```
+H_old := ActiveHeads
+H_new := min(H_old · H_old, H_max)        -- square, clamp at ceiling
+spawn_per_parent := H_new / H_old          -- integer
+
+for parent_idx in 0 .. H_old - 1:
+    for child_local in 1 .. spawn_per_parent - 1:    -- skip 0 (parent keeps slot)
+        child_idx := H_old + parent_idx · (spawn_per_parent - 1) + (child_local - 1)
+        copy parent's B-spline coefficients into child slot
+        for each c_j in child's coefficients:
+            c_j ← c_j · exp( N(0, σ²) )    -- log-normal perturbation, seeded RNG
+        copy parent's clip counters / KL EMA into child as starting state
+
+ActiveHeads := H_new
+```
+
+Properties:
+
+- Each existing head retains its slot and its coefficients unchanged.
+- `H_new − H_old` new heads are populated as perturbed clones of the existing heads.
+- The perturbation is **multiplicative log-normal** with `σ ≈ 0.01`. Multiplicative is consistent with the GM=1 gauge: it preserves expected `log |c_j|` (so the new head also satisfies GM=1 to first order) and breaks symmetry without large jumps.
+- The RNG used is the **per-layer seeded RNG**, so the operation is deterministic given the saved state (§9).
+- Because GM=1 is approximately preserved by the perturbation, the new heads' coefficients land in the same canonical range; no re-gauge is needed at squaring time (the next per-inference step's gauge fixing will tidy any first-order drift).
+
+#### 5.4.5 Growth Pattern and Self-Limitation
+
+Squaring produces **super-exponential capacity growth**:
+
+```
+ActiveHeads:  2 → 4 → 16 → 256 → 65536 → ...   (clamped at H_max)
+```
+
+Per-head clip pressure drops **roughly linearly in head count** (each head specialises to a smaller fraction of the input distribution). The asymmetry between super-exponential capacity growth and linear pressure relief produces **inherent self-limitation**:
+
+- One squaring event typically reduces `clip_rate_ema` by a factor of `H_new / H_old`.
+- After one or two events, `clip_rate_ema < τ_squaring`, the trigger goes silent, and `ActiveHeads` freezes.
+
+**No adaptive threshold is required.** The dynamics produce stable equilibrium on their own. Different layers settle at different `ActiveHeads` values based on their data complexity.
+
+#### 5.4.6 Coupling with the Productivity Low-Lift
+
+The aggressive low-lift threshold (`g/2`, §5.2.4) is essential to the meaning of the squaring trigger:
+
+- **Without aggressive low-lift:** some coefficients drift toward zero and become dead weight. A head's effective capacity is `M < N`, and the active `M` coefficients overload, raising `clip_rate` for reasons that have nothing to do with genuine capacity demand. Squaring fires prematurely on wasted-budget noise.
+- **With aggressive low-lift:** every coefficient stays productive. Effective capacity equals nominal capacity. `clip_rate` rises only when the head genuinely needs more representational room. Squaring fires only when capacity expansion is actually warranted.
+
+The two mechanisms together promote head squaring from "noisy event" to "meaningful diagnostic signal."
+
+#### 5.4.7 One-Way Only — No Head Merging
+
+Heads never merge. `ActiveHeads` is monotonic non-decreasing across a deployment run.
+
+Rationale: merging two heads' splines requires choosing how to combine their coefficients. Any combination (average, weighted average, etc.) destroys learned structure that the two heads had specialised for. Mechanism #1's low-lift already handles coefficient-level rescue; head-level merging would risk catastrophic forgetting for no clear gain.
+
+If a deployment scenario requires reducing `ActiveHeads` (e.g. reducing serving cost), the only supported approach is **load a checkpoint from before the squaring event** — not in-place merge.
+
+#### 5.4.8 Failure Mode — Hitting the Ceiling
+
+If `clip_rate_ema` remains above `τ_squaring` even with `ActiveHeads = H_max`, squaring is impossible. The layer enters a **degraded-but-stable regime**:
+
+- Mechanism #1 fires more often than typical (high clip rate).
+- The Auto mode (§5.2.5) keeps the layer in Mode C (always-flatten) most of the time.
+- The forward output remains correct; only the per-head splines are operating at capacity.
+
+This regime is the right behaviour: it tells the operator "this layer is under-provisioned for the data at the architecture's resolution." The diagnostic value of `ActiveHeads = H_max ∧ clip_rate ≫ τ_squaring` is high; it is a clear, observable signal that the model architecture itself is the bottleneck.
+
+#### 5.4.9 Diagnostic Value of Final `ActiveHeads`
+
+After a deployment has settled, the per-layer `ActiveHeads` distribution is a free readout of the layer's informational complexity on the observed data:
+
+- Layers stuck at 2: simple, uniform attention patterns. Probably could have been smaller in the original architecture.
+- Layers at 4–16: moderate complexity, multi-modal attention where it matters.
+- Layers at 64+ or hitting `H_max`: doing genuinely complex discrimination work.
+
+This is information not available from any standard transformer at any inspection level. It is a side-effect of the spec, not a designed feature, but it is genuinely useful.
+
+#### 5.4.10 Invariants Maintained
+
+After every per-inference pipeline step (§7), per layer:
+
+- **(HS-1)** `ActiveHeads ∈ ℕ`, `2 ≤ ActiveHeads ≤ H_max`, monotonic non-decreasing across the run.
+- **(HS-2)** `ActiveHeads` is a power of 2 (consequence of repeated squaring from the initial value 2). After clamping at `H_max`, this may not hold if `H_max` is not a power of 2; in that case `ActiveHeads ∈ {2, 4, 16, 256, …, H_max}`.
+- **(HS-3)** Inactive heads (index `≥ ActiveHeads`) contribute zero to the layer's forward output.
+- **(HS-4)** Squaring transitions are deterministic given the per-layer RNG state.
+
+
 
 
 
