@@ -910,6 +910,143 @@ Assert: S'_1 == S'_2 (bit-identical) and Y_1 == Y_2 (bit-identical).
 
 A failure indicates a determinism leak somewhere in the implementation; the test must be treated as load-bearing infrastructure, not as a soft check.
 
+---
+
+## 10. Invariants and Guarantees (Consolidated)
+
+This section consolidates every invariant introduced in §5–§9 into a single canonical list. Implementations must satisfy all of these. The test suite (§12) provides one or more checks for each.
+
+### 10.1 Mechanism #1 Invariants (per head, after each pipeline step)
+
+- **(M1-1) Per-window product preservation.** For every coefficient `c_i` and its window `W(i)`, `Π_{j ∈ W(i)} |c_j|` is unchanged across a single mechanism-#1 sweep, up to floating-point tolerance.
+- **(M1-2) Sign preservation.** No mechanism-#1 operation flips the sign of any coefficient.
+- **(M1-3) Bounded coefficients.** After cascade termination, every coefficient satisfies `g/2 ≤ |c_i| ≤ 3·g` where `g` is its window's geometric mean.
+- **(M1-4) Scale equivariance.** For any `α > 0`, mechanism #1 applied to `(α · c_j)` produces `α · (mechanism #1 applied to (c_j))`.
+
+### 10.2 GM=1 Gauge Invariants (per head, after pipeline step 9)
+
+- **(GM-1) Gauge fixed.** `|G − 1| < ε_gauge`, where `ε_gauge` is at machine-precision tolerance for the head's coefficient count.
+- **(GM-2) Forward output preservation.** The attention weights computed before and after gauge renormalisation are bit-identical (modulo FP reordering).
+- **(GM-3) Sign preservation.** Gauge renormalisation preserves coefficient signs.
+
+### 10.3 Head-Squaring Invariants (per layer, across the run)
+
+- **(HS-1) Bounded.** `2 ≤ ActiveHeads ≤ H_max` at all times.
+- **(HS-2) Power-of-2 progression.** `ActiveHeads ∈ {2, 4, 16, 256, …}` until clamped at `H_max`.
+- **(HS-3) Inactive masking.** Heads with index `≥ ActiveHeads` contribute zero to the layer's forward output.
+- **(HS-4) Deterministic squaring.** Squaring transitions are deterministic given the per-layer RNG state.
+- **(HS-5) Monotonicity.** `ActiveHeads` is monotonic non-decreasing across a deployment run.
+
+### 10.4 Local-Learning Invariants (per coefficient, per update)
+
+- **(LL-1) Locality.** Each NLMS update touches at most `k+1` coefficients per observed score.
+- **(LL-2) Determinism.** Each update is deterministic given `(s, target, denom, η, current coefficients)`.
+- **(LL-3) Sign preservation in expectation.** Mechanism #1 immediately corrects any pathological single-step sign flip via low-lift.
+- **(LL-4) No autograd.** No gradient state, optimiser state, or autograd graph is constructed.
+
+### 10.5 Lifecycle Invariants (per head, per layer, across the run)
+
+- **(LC-1) Phase monotonicity.** `status` transitions only `SoftmaxActive → KANActive`, never the reverse.
+- **(LC-2) Per-head independence.** No layer-level synchronisation gates per-head transitions.
+- **(LC-3) Atomic handover.** A head's `status` flips between two consecutive forward passes; no intermediate state is observable.
+- **(LC-4) Retrofit identity.** At first forward pass after a retrofit load, the layer's output equals standard softmax attention's output to the precision of the `exp` grid fit.
+
+### 10.6 Determinism Invariants (per deployment run)
+
+- **(DT-1) State-determined evolution.** Given identical saved state and identical input sequences, two runs produce bit-identical outputs and bit-identical post-state.
+- **(DT-2) No environmental randomness.** All randomness in the layer derives from the saved per-layer RNG.
+- **(DT-3) Save/load round-trip.** A model checkpointed mid-run and reloaded continues evolution as if no save/load had occurred.
+
+### 10.7 Compositional Invariants (across mechanisms)
+
+- **(C-1) Output gauge invariance.** The forward attention output is invariant under uniform positive rescaling of any head's coefficients (the property GM=1 exploits).
+- **(C-2) Productivity-squaring coupling.** The aggressive low-lift threshold (`g/2`) is a precondition for the meaning of the squaring trigger; without it, squaring fires on wasted-budget noise rather than genuine capacity demand.
+- **(C-3) Sharpening-budget coupling.** The Phase D self-distillation rule cannot collapse to one-hot because mechanism #1 + GM=1 together pin the multiplicative budget; sharpening can only redistribute mass within the budget.
+
+---
+
+## 11. Parameters and Defaults
+
+All parameters are per-layer-overridable. Defaults are tuned for typical transformer attention shapes (`d ∈ [128, 1024]`, `L ∈ [128, 4096]`).
+
+### 11.1 B-Spline Configuration
+
+| Parameter | Symbol | Default | Notes |
+|---|---|---|---|
+| Basis order | `k` | 3 | Cubic. Window size = `2k+1 = 7`. |
+| Knot count | `N` | 64 | Resolution of the spline; trade off vs memory. |
+| Grid range | `[s_low, s_high]` | `[−8, +8]` nats | Covers typical `Q·Kᵀ/√d` range. Re-tune per layer if scores known to live elsewhere. |
+| Non-negativity | — | `φ = ψ²` parametrisation | Ensures `φ(s) ≥ 0` strictly. |
+
+### 11.2 Mechanism #1 Thresholds
+
+| Parameter | Default | Notes |
+|---|---|---|
+| High-clip ratio | 3 | `|c_i| > 3·g` triggers high clip. Outlier detection. |
+| Low-lift ratio | 2 (i.e. `g/2`) | `|c_i| < g/2` triggers low lift. Productivity-tuned. |
+| Cascade iteration cap | 16 | Safety against pathological loops. Typical convergence: 1–3. |
+
+### 11.3 Auto-Mode Thresholds
+
+| Parameter | Default | Notes |
+|---|---|---|
+| Calm boundary | `τ_calm = 0.02` | `clip_rate < 2 %` → Mode A. |
+| Stressed boundary | `τ_stressed = 0.10` | `clip_rate > 10 %` → Mode C. |
+| Mode hysteresis | hysteresis between `τ_calm` and `τ_stressed` | Avoids rapid mode flapping near boundary. |
+
+### 11.4 Local-Learning Parameters
+
+| Parameter | Symbol | Default | Notes |
+|---|---|---|---|
+| NLMS step | `η` | `1.0` | NLMS auto-scales via basis-norm denominator. Effective per-step magnitude is auto-tuned. |
+| NLMS denominator guard | `δ` | `1e-6` | Prevents divide-by-zero when basis activations vanish. |
+| Sharpening power (Phase D) | `α` | `1.1` | Gentle per-step push. Mechanism #1 enforces budget. |
+
+### 11.5 Convergence and Handover
+
+| Parameter | Default | Notes |
+|---|---|---|
+| KL convergence threshold | `ε_KL = 0.01 nats` | Tight per-pass distribution match. |
+| KL EMA decay | `λ = 0.01` | Effective horizon ≈ 100 passes. |
+| Sustained passes for handover | `N_confirm = 100` | Avoids handover on lucky single-batch noise. |
+| Optional task-loss tolerance | `ε_task = max(0.005, 0.01·L_task)` | Used only if labelled eval stream available. |
+| Optional task-loss eval cadence | `K_eval = 100 batches` | Same. |
+
+### 11.6 Head-Squaring Parameters
+
+| Parameter | Default | Notes |
+|---|---|---|
+| Squaring trigger ratio | `τ_squaring = 0.10` | `clip_rate_ema > 10 %`. |
+| Sustained sweeps for squaring | `K_squaring = 64` | Avoids noise-driven squaring. |
+| Initial active heads | 2 | Specification mandate. |
+| Maximum active heads | `H_max = embedding_dim / 2` | Architectural ceiling: ≥ 2 channels per head. |
+| Head-split perturbation σ | `σ = 0.01` | Log-normal multiplicative perturbation on cloned coefficients. |
+
+### 11.7 Determinism / Thread Safety
+
+| Parameter | Default | Notes |
+|---|---|---|
+| Threading strategy | A (batch-boundary lock) | See §9.3.1. Strategy B reserved for v2. |
+| Per-layer RNG seed | derived from layer identity + `grid_spec` hash | Ensures retrofit reproducibility across deployments. |
+
+### 11.8 Configuration Flags
+
+| Flag | Default | Effect |
+|---|---|---|
+| `disable_kan_at_inference` | `false` | If `true`, skip all post-forward state mutation; behaves exactly as standard softmax attention. Use for emergency rollback. |
+| `force_mode` | `Auto` | Override the per-layer Auto rule; can pin the layer to Mode A, B, C, or D for ablation studies. |
+| `pin_active_heads` | none | If set to an integer `≥ ActiveHeads`, disable squaring while still permitting evolution within the pinned head count. |
+| `freeze_after_takeover` | `false` | If `true`, disable Phase D evolution once a head has handed over (Phase D becomes a no-op for the local rule; mechanism #1 and gauge still run). For benchmarking the static-KAN baseline. |
+| `skip_redundant_softmax` | `true` | Skip `w_softmax` computation in step 3 of the pipeline once a head has handed over. Reduces post-takeover overhead. |
+
+### 11.9 Tuning Notes
+
+- **`α` (sharpening power)** is the primary knob for "how aggressively does the KAN diverge from softmax." `α = 1.0` makes Phase D a no-op; `α = 1.1` is the spec default; `α = 1.5` produces aggressive divergence and may saturate mechanism #1.
+- **`τ_squaring`** trades head-growth speed against the meaningfulness of each squaring event. Lower values grow heads faster (capacity comes online sooner); higher values demand stronger evidence before adding capacity.
+- **`N_confirm`** is the primary knob for "how cautious is handover." `N_confirm = 100` is the default; `N_confirm = 1000` is ultra-cautious; `N_confirm = 10` is aggressive (recommended only for testing).
+- **`H_max`** can be reduced below `embedding_dim / 2` to limit the worst-case memory cost of a layer that aggressively squares; at the cost of forcing the failure mode (§5.4.8) to engage sooner under capacity pressure.
+
+
 
 
 
