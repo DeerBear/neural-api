@@ -598,6 +598,172 @@ For typical sequence lengths (`L ≫ N`), the per-pass cost is **dominated by th
 - **(LL-3)** The update is sign-preserving in expectation (single-step updates can flip sign in pathological cases; mechanism #1 immediately corrects via low-lift).
 - **(LL-4)** No gradient state, no optimiser state, no autograd graph is constructed at any point.
 
+---
+
+## 6. Convergence and Handover Criterion
+
+The transition from Phase M (Mimicry, softmax in forward path) to Phase D (Divergence, KAN in forward path) is governed by a per-head convergence test. The test answers a single question: **"Has this head's KAN learned to reproduce softmax closely enough that swapping it into the forward path is safe?"**
+
+### 6.1 Convergence Metric
+
+The metric is **Kullback–Leibler divergence** of the softmax distribution from the KAN distribution, computed per attention row, averaged over the row's positions:
+
+```
+KL_row = Σ_j softmax(s_·j) · ( log softmax(s_·j) − log (φ(s_·j) / Σ_j' φ(s_·j')) )
+```
+
+**Direction:** `KL(softmax ‖ KAN)`. Reverse KL — zero-avoiding — penalises the KAN for assigning low probability anywhere softmax assigns mass. This produces a smoother fit during Phase M than forward KL would (forward KL is mode-seeking and can leave undershoots).
+
+**Log base:** **natural log (nats)**, matching the convention used by the host model's training cross-entropy loss. Mixing log bases makes ε thresholds non-comparable across the loss landscape.
+
+### 6.2 EMA Aggregation
+
+`KL_row` is computed for every attention row in every forward pass, then aggregated per head:
+
+```
+KL_pass := mean_rows(KL_row)              -- per forward pass
+KL_ema  := (1 − λ) · KL_ema  +  λ · KL_pass     -- EMA, λ ≈ 0.01
+```
+
+The EMA smooths the per-pass noise. Default decay `λ = 0.01` corresponds to an effective horizon of ~100 passes.
+
+### 6.3 Handover Criterion
+
+A head transitions from `SoftmaxActive` to `KANActive` when:
+
+```
+KL_ema < ε_KL    sustained for at least N_confirm consecutive passes
+```
+
+Defaults:
+
+- `ε_KL = 0.01 nats`. A KL below this corresponds to attention distributions that differ by less than ~1 % in any individual weight (rule of thumb).
+- `N_confirm = 100 consecutive passes`. Prevents handover on a single lucky batch.
+
+### 6.4 Optional Task-Loss Parity Check
+
+If a labelled evaluation stream is available at deployment (e.g. shadow-traffic replay, A/B testing, periodic offline eval batches), an additional safety check can be enabled:
+
+```
+L_task(KAN) ≤ L_task(softmax) + ε_task    over the eval stream, every K_eval batches
+```
+
+When enabled, both conditions (KL below threshold AND task parity) must hold for handover. When no labels are available (the typical inference deployment), only the KL condition applies.
+
+Defaults if enabled: `ε_task = max(0.005, 0.01 · L_task)`, `K_eval = 100 batches`.
+
+### 6.5 Atomic Handover Action
+
+When the criterion fires for a head:
+
+```
+status[head]      ← KANActive
+forward_path[head] ← KAN_normaliser     -- φ(s) / Σφ(s)
+local_rule[head]  ← SelfDistillation     -- §5.5.3
+KL_ema[head]      ← unchanged             -- continues to be tracked for diagnostics
+```
+
+The transition is **atomic per head per layer**. Each head's flip is observable in the very next forward pass.
+
+### 6.6 One-Way Property
+
+There is no rule that reverts a head from `KANActive` to `SoftmaxActive`. Reversion would create oscillation under any noise in the post-takeover dynamics. Stability of `KANActive` heads is guaranteed by:
+
+- Mechanism #1's clip and lift, which bound coefficient magnitudes (§5.2).
+- The GM=1 gauge, which bounds overall scale drift (§5.3).
+- Auto mode in mechanism #1, which switches to flatten-only behaviour under high clip pressure (§5.2.5).
+- Head squaring, which adds capacity if the per-head budget is genuinely insufficient (§5.4).
+
+If post-takeover dynamics become pathological in a way these mechanisms cannot recover, the correct action is **operator intervention** (load an earlier checkpoint, reduce the deployment's input distribution shift, etc.) — not automatic reversion.
+
+### 6.7 Initialisation State at First Inference
+
+At the first forward pass after a model loads (whether retrofit or resumed):
+
+```
+status[head]           = SoftmaxActive
+KL_ema[head]           = +∞               -- will descend over the first ~λ⁻¹ passes
+consecutive_low_passes = 0
+coefficients           = exp-fit on grid (§5.1, retrofit) OR loaded checkpoint state
+```
+
+The forward path produces standard softmax output on the first pass, identical to the original trained model. Phase M begins from there.
+
+---
+
+## 7. Per-Inference Pipeline (Locked Ordering)
+
+For each forward pass through an attention layer using this spec, the operations execute in this exact order. The ordering is **load-bearing** — earlier sections rely on properties that hold only because the operations execute in this sequence.
+
+```
+For each attention layer:
+  For each active head (h ∈ 0 .. ActiveHeads − 1):
+
+    -- Forward computation --
+    1. Compute the head's attention scores
+       s = Q_h · K_hᵀ / √d
+
+    2. Evaluate the spline at every score
+       φ_h(s_ij) for all (i, j)
+
+    3. Compute both candidate weight matrices
+       w_softmax = row_softmax(s)
+       w_KAN     = row_normalise(φ_h(s))   -- φ_h(s_ij) / Σ_j' φ_h(s_ij')
+
+    4. Select the forward-path weights according to status
+       w = (status[h] == KANActive) ? w_KAN : w_softmax
+
+    5. Compute the attended output for this head
+       attended_h = w · V_h
+
+    -- Post-forward state mutation (per head, in order) --
+    6. Compute KL_pass from (w_softmax, w_KAN) and update KL_ema
+
+    7. Apply the autonomous local learning rule
+       if status[h] == SoftmaxActive: NLMS toward exp(s)        (§5.5.2)
+       else:                          NLMS toward sharpened(w)  (§5.5.3)
+
+    8. Run mechanism #1 sweep, cascading to fixed point
+       (high-clip + low-lift + product-preserving redistribute, §5.2)
+       Update clip_rate_ema and consecutive_high_sweeps counters.
+
+    9. Apply GM = 1 gauge renormalisation
+       c_j ← c_j / G_h     (§5.3)
+
+   -- Post-mutation policy checks --
+    10. If status[h] == SoftmaxActive
+        and KL_ema < ε_KL for ≥ N_confirm consecutive passes:
+           perform handover (§6.5)
+
+  -- Per-layer post-head checks (after all heads processed) --
+  11. If ActiveHeads < H_max
+      and clip_rate_ema > τ_squaring
+      for ≥ K_squaring consecutive sweeps:
+         perform head squaring (§5.4.4)
+
+  -- Concat and project --
+  12. Concatenate per-head attended outputs across all H_max heads.
+      Inactive heads (h ≥ ActiveHeads) contribute zero (mask).
+
+  13. Apply the layer's standard linear output projection W_O.
+```
+
+### 7.1 Why This Order
+
+- **Step 4 commits the forward output before any state mutation** (steps 6–11). Inference never sees partially-mutated state.
+- **Step 7 (learning) precedes step 8 (mechanism #1)** so mechanism #1 cleans up after the additive update's perturbation of window products.
+- **Step 8 (mechanism #1) precedes step 9 (gauge)** so the rebalance operates on the pre-renormalised state where window products are meaningfully preserved; the gauge then resets the canonical scale.
+- **Step 10 (handover check) is per-head and runs after step 9** so the check uses the canonicalised state.
+- **Step 11 (squaring) is per-layer and runs after all heads' bookkeeping** so `clip_rate_ema` reflects the full layer's pressure.
+- **Step 12 (concat) is unchanged from standard multi-head attention** — the spec requires no modification to the concat or output-projection plumbing.
+
+### 7.2 Cost of the Post-Forward Steps
+
+Steps 6–11 add work proportional to `H · L²` (KL computation, NLMS updates) plus `H · N · cascade_iters` (mechanism #1) plus `H · N` (gauge). The first term is asymptotically equal to the existing forward score cost; the latter two are negligible relative to the attention's `O(L² · d)` cost. Net per-pass overhead during Phase M is approximately **2× standard softmax attention**; during Phase D it drops to approximately **1.2× standard softmax attention** (no `w_softmax` computation needed in step 3, no mimicry target evaluation in step 7).
+
+A configuration flag may disable Phase M's `w_softmax` computation in step 3 once a head has handed over (skip the redundant softmax). Default: enabled (skip).
+
+
 
 
 
