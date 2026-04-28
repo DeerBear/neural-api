@@ -298,6 +298,85 @@ After each invocation of mechanism #1, on every head:
 - **(M1-3)** No coefficient is below `g/2` or above `3·g` of its own window's `g`, after cascade termination.
 - **(M1-4)** Scale-equivariance: applying mechanism #1 to coefficients `(c_j)` then multiplying by `α > 0` produces the same result as multiplying by `α` first then applying mechanism #1.
 
+### 5.3 GM=1 Gauge Fixing (per head)
+
+#### 5.3.1 Premise — The Gauge Freedom
+
+Because the attention weights are computed by row-normalisation:
+```
+w_ij = φ(s_ij) / Σ_j' φ(s_ij')
+```
+multiplying every coefficient `c_j` by any positive scalar `α > 0` leaves `w_ij` **identically unchanged**. The KAN therefore has a **gauge freedom**: a one-parameter family of coefficient configurations that all produce the same forward output.
+
+This freedom is the only direction in which the coefficient vector can drift without changing the model's behaviour. Pinning that direction is free — it costs the model nothing in expressive power — and pays off in stability, interpretability, and the meaning of mechanism #1's thresholds.
+
+#### 5.3.2 The Gauge Choice — `GM = 1`
+
+The chosen gauge is **per-head geometric mean equal to 1**:
+```
+G(head) := exp( mean_j( log |c_j| ) )  =  1
+```
+
+Equivalently: the sum of log-magnitudes of all coefficients in a head is zero. Some coefficients have `|c_j| < 1`, some have `|c_j| > 1`, and they multiplicatively balance.
+
+**Why per-head, not per-layer:** each head is an independent representational budget (§5.5). Per-head gauge gives each head its own canonical scale; per-layer gauge would tie heads together and dilute the "more heads = more budget" interpretation.
+
+#### 5.3.3 The Renormalisation Operation
+
+After mechanism #1 has converged in a given inference step (§5.2.6), per head:
+
+```
+G   := exp( mean_j( log |c_j| ) )         -- in log-space, O(N)
+c_j ← c_j / G                              -- uniform rescale, O(N)
+```
+
+That is the entire operation. One pass to compute `G`, one pass to apply.
+
+**Numerical implementation note.** Use log-space throughout: maintain or recompute `Σ_j log|c_j|`, divide by `N` to get `log G`, then `c_j ← c_j · exp(−log G)`. This avoids the `Π|c_j|` underflow/overflow that direct GM computation would suffer for `N` in the dozens.
+
+#### 5.3.4 Why It Costs Nothing in Forward Output
+
+Before renormalisation, the spline outputs `φ(s) = Σ_j c_j · B_j(s)`. After renormalisation by uniform factor `1/G`:
+```
+φ_new(s) = Σ_j (c_j / G) · B_j(s) = (1/G) · Σ_j c_j · B_j(s) = φ_old(s) / G
+```
+And the row-normalised attention weight:
+```
+w_new = φ_new(s) / Σ φ_new = (φ_old(s)/G) / (Σ φ_old/G) = φ_old(s) / Σ φ_old = w_old
+```
+
+The attention output is **bit-identical** before and after renormalisation (up to floating-point reordering of operations). The renormalisation is a pure gauge transformation.
+
+#### 5.3.5 Composition with Mechanism #1
+
+Mechanism #1 preserves **per-window products** (M1-1). The GM=1 renormalisation applies a uniform multiplicative rescaling, which **changes** every window product by `(1/G)^(2k+1)`. There is no contradiction: mechanism #1 preserves whatever window products it finds at the start of its sweep. The renormalisation simply resets the "preserved targets" to the new gauge.
+
+The locked ordering (also encoded in §7) is:
+
+```
+1. local learning update (additive, perturbs both window products and G)
+2. mechanism #1 sweep (cascades to fixed point; preserves whatever products it sees)
+3. GM = 1 renormalisation (uniform rescale; resets gauge)
+```
+
+After step 3, the head is in a canonical state: GM=1 and all window products consistent with that gauge.
+
+#### 5.3.6 What the Gauge Buys
+
+- **Meaningful thresholds.** Mechanism #1's `3·g` and `g/2` thresholds are now expressed against a stable reference. With GM=1, the typical window `g` is approximately 1, so coefficients live (approximately) in `[1/6, 6]`. Thresholds remain comparable across layers, across heads, and across time.
+- **No coefficient-magnitude drift.** Without the gauge, the additive learning updates would slowly inflate or deflate the overall coefficient scale (depending on the data distribution). The gauge eliminates this nuisance dynamic entirely.
+- **Numerical stability.** `log |c_j|` is bounded; `Σ log |c_j|` cannot underflow or overflow; the GM computation is well-conditioned regardless of `N`.
+- **Foundation for head squaring.** With the gauge in place, each head's representational budget is well-defined (the bounded coefficient interval), making "this head has saturated its budget" a meaningful statement (§5.5).
+
+#### 5.3.7 Invariants Maintained
+
+After step 7 of the per-inference pipeline (§7), on every head:
+
+- **(GM-1)** `|G − 1| < ε_gauge` where `ε_gauge` is at machine-precision tolerance for the head's coefficient count.
+- **(GM-2)** The forward attention weights computed before and after renormalisation are bit-identical (up to FP reordering).
+- **(GM-3)** Every coefficient sign is preserved.
+
+
 
 
 
