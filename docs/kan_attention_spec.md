@@ -1046,6 +1046,208 @@ All parameters are per-layer-overridable. Defaults are tuned for typical transfo
 - **`N_confirm`** is the primary knob for "how cautious is handover." `N_confirm = 100` is the default; `N_confirm = 1000` is ultra-cautious; `N_confirm = 10` is aggressive (recommended only for testing).
 - **`H_max`** can be reduced below `embedding_dim / 2` to limit the worst-case memory cost of a layer that aggressively squares; at the cost of forcing the failure mode (§5.4.8) to engage sooner under capacity pressure.
 
+---
+
+## 12. Testing Strategy
+
+The test suite is structured in three tiers. Tier 1 (Invariant Tests) verifies that the spec's mathematical guarantees hold. Tier 2 (Functional Tests) verifies that the design dynamics behave as intended. Tier 3 (Integration Tests) verifies end-to-end behaviour on realistic models. **Every invariant in §10 must have at least one corresponding tier-1 test.**
+
+### 12.1 Tier 1 — Invariant Tests
+
+| ID | Verifies | Description |
+|---|---|---|
+| **IT-M1** | M1-1 | After any single mechanism-#1 sweep on a randomised coefficient set, every window's `Π|c_j|` is preserved within `1e-6` relative tolerance. |
+| **IT-Sign** | M1-2, GM-3 | Run mechanism #1 + gauge on randomised coefficients (including negatives); assert no sign flips. |
+| **IT-Bound** | M1-3 | After cascade termination, every coefficient lies in `[g/2 − ε, 3·g + ε]` for its window's `g`. |
+| **IT-Scale** | M1-4 | Apply mechanism #1 to `(c_j)` and to `(α · c_j)` for `α ∈ {0.1, 1, 10, 100}`; assert results differ by exactly factor `α`. |
+| **IT-Gauge** | GM-1 | After step 9 of the pipeline, per head, `|G − 1| < 1e-6`. |
+| **IT-GaugeOutput** | GM-2 | The forward attention weights computed with raw coefficients vs renormalised coefficients differ by less than FP rounding noise. |
+| **IT-HSBound** | HS-1, HS-2 | Across a synthetic input stream forcing many squaring events, `ActiveHeads` always lies in the allowed power-of-2 progression and never exceeds `H_max`. |
+| **IT-HSMask** | HS-3 | With `ActiveHeads = 4` and `H_max = 16`, the layer's forward output equals the layer's forward output computed only over heads 0–3. |
+| **IT-HSMonotonic** | HS-5 | Across any input stream, `ActiveHeads` never decreases. |
+| **IT-LLLocal** | LL-1 | An NLMS update on score `s` modifies only the `k+1` coefficients with `B_j(s) ≠ 0`. |
+| **IT-LCMonotonic** | LC-1 | Across any input stream, `status` for any head transitions only `SoftmaxActive → KANActive`, never reverse. |
+| **IT-Retrofit** | LC-4 | Load a vanilla softmax checkpoint; first forward output equals standard softmax attention's output to within `1e-4` (precision of the `exp` grid fit). |
+| **IT-Det** | DT-1, DT-3 | Run the determinism verification protocol of §9.5; assert byte-identical state and outputs across two independent runs. |
+
+### 12.2 Tier 2 — Functional Tests
+
+| ID | Verifies | Description |
+|---|---|---|
+| **FT-Mimic** | Phase M dynamics | On a stationary score distribution, `KL_ema` falls below `ε_KL` within a bounded number of inferences (e.g. `5 · N_confirm`). |
+| **FT-Handover** | §6.3 | Once `KL_ema` is below threshold for `N_confirm` passes, the head's `status` flips between two consecutive passes (atomicity). |
+| **FT-Phase D** | §5.5.4 | After takeover, on a stream where one specific score region carries genuine signal, `φ` develops a peak at that region within a bounded number of inferences. |
+| **FT-NoCollapse** | §5.5.4, C-3 | After extended Phase D running, no head collapses to a one-hot attention distribution; entropy of the attention output remains above a small floor. |
+| **FT-Squaring** | §5.4.3 | A synthetic input stream engineered to force high `clip_rate` triggers `ActiveHeads` growth within `K_squaring` consecutive sweeps. |
+| **FT-SquaringSelfLimit** | §5.4.5 | After two squaring events, `clip_rate_ema` falls below `τ_squaring` and `ActiveHeads` freezes. |
+| **FT-ModeAbsent** | Mode D exclusion | Run the layer with all default settings; assert `(HighClipShare, LowLiftShare) = (Proportional, InverseProportional)` (Mode D) is never selected by Auto. |
+| **FT-ModeABDifferent** | §5.2.5 | Pin Mode A vs Mode C via `force_mode`; on identical input streams, assert coefficient trajectories diverge measurably (sanity check that the mode flag is load-bearing). |
+
+### 12.3 Tier 3 — Integration Tests
+
+| ID | Verifies | Description |
+|---|---|---|
+| **INT-VanillaParity** | End-to-end retrofit | Train a small softmax transformer on a benchmark (e.g. CIFAR-10 patch-classifier or a MNIST-scale text task); retrofit; run inference; assert task metrics after Phase-M convergence are within statistical noise of the original softmax model. |
+| **INT-PhaseDImproves** | Information surfacing | Same model as INT-VanillaParity, run for an extended Phase-D period on the test set; assert task metrics either improve or are preserved (no regression). |
+| **INT-Checkpoint** | DT-3 | Mid-run, save a checkpoint, kill the process, reload, continue. Compare the resulting state and outputs after another N batches against a non-interrupted run. Assert byte-identical. |
+| **INT-MultiLayer** | Per-layer independence | A multi-layer transformer must show different layers in different phases at the same wall-clock time, and `ActiveHeads` distributions vary per layer based on layer-specific data complexity. |
+| **INT-DisableSwitch** | `disable_kan_at_inference` | Setting the kill switch makes the layer behaviourally identical to standard softmax attention. |
+
+### 12.4 Test Infrastructure Requirements
+
+- **Reproducible RNG.** All tests must use seeded RNGs; failures must be reproducible from the seed alone.
+- **FP tolerances documented.** Each test specifies its allowed FP tolerance; tolerances differ between strict bit-identity checks (DT-1) and approximate equality checks (INT-VanillaParity).
+- **Synthetic input generators.** Tier 1 and Tier 2 tests use constructed inputs (not real data) to isolate the property under test.
+- **Performance regression tests** (separate suite, not gating): verify the per-pass overhead targets in §7.2 are met within tolerance.
+
+### 12.5 What Is Not Tested at the Unit Level
+
+- **Soundness of Phase D divergence on real-world data distributions.** This requires INT-tier benchmarks against held-out evaluation sets and is fundamentally empirical, not a property the spec can assert by construction.
+- **Performance characteristics on specific hardware.** Performance tests are platform-specific and are not part of the property-test suite.
+
+---
+
+## 13. Roadmap
+
+The spec ships in three tiers of increasing scope. v1 is the focus of the initial implementation; v2 and v3 are reserved for future revisions and may evolve as v1 deployment experience accumulates.
+
+### 13.1 v1 — Softmax-Replacement KAN (this spec)
+
+Scope:
+
+- KAN normaliser replacing softmax only.
+- Q/K/V and output projections remain standard linear layers.
+- Mimicry → takeover → divergence per-head lifecycle.
+- Mechanism #1 with all four modes plus Auto.
+- GM=1 gauge fixing.
+- Head squaring with self-limiting dynamics.
+- Determinism Strategy A (batch-boundary lock).
+- Retrofit path for any pre-trained softmax transformer.
+
+Deliverable: one new attention layer class, one new network-builder method, full test suite per §12.
+
+### 13.2 v2 — KAN-ified Q/K/V Projections
+
+Scope:
+
+- Extend the deferred-mimicry-then-takeover lifecycle to Q, K, V projections.
+- Each projection gains a per-head KAN edge that learns to mimic its trained linear projection at inference, then takes over.
+- Post-takeover divergence rule for projections: **attention-coupled** — reinforce projections that contribute to sharpening (measured by entropy of the post-softmax attention output). This couples the projection KANs and the normaliser KAN toward the shared "surface hidden information" goal.
+- Same mechanism #1, gauge, head squaring infrastructure inherited from v1.
+
+Deliverable: extended attention layer class supporting full-KAN at inference. Strategy B (per-thread shadow copies) implementation if profiling demands it.
+
+### 13.3 v3 — Cross-Layer Coupling (Speculative)
+
+Scope:
+
+- Layers that have handed over broadcast a coarse "attention sharpness" signal to adjacent layers.
+- Adjacent layers' Auto-mode and squaring decisions become functions of (own state, neighbour states).
+- Goal: coordinated capacity allocation across the stack rather than per-layer independent dynamics.
+
+Deliverable: TBD pending v1 + v2 deployment experience.
+
+### 13.4 Out of Scope (No Planned Version)
+
+- **Training-time KAN.** The spec's "vanilla training, KAN at inference" stance is permanent. No version will introduce KAN state at training time.
+- **Cross-hardware bitwise determinism.** The same-hardware property of §9.4 is sufficient for almost all use cases. A canonical-precision mode is not planned.
+- **Head merging.** The one-way head-squaring property of §5.4.7 is permanent. To reduce head count, load a checkpoint from before the squaring event.
+
+---
+
+## 14. Integration Notes (Library-Abstract)
+
+This section describes how the spec integrates with a host attention library, abstracted across implementation languages.
+
+### 14.1 Touch Surface
+
+The spec is a **single new attention normaliser layer**, plus one new network-builder convenience method that wraps the existing attention construction with the new normaliser substituted for the existing softmax operator.
+
+| Component | Status |
+|---|---|
+| Q/K/V projections | **Reused unchanged** from the host library's existing attention. |
+| Score computation `Q·Kᵀ/√d` | **Reused unchanged**. |
+| Row-normalisation step | **Replaced** by the new normaliser layer. |
+| Multi-head concat | **Reused unchanged**, with the new layer's mask of inactive heads. |
+| Output projection `W_O` | **Reused unchanged**. |
+| Forward / backward training paths | **Reused unchanged** (training is vanilla softmax). |
+| Save / load infrastructure | **Extended** by the per-layer state schema of §8.1, with the retrofit-source compatibility of §8.3. |
+
+The total new code surface is on the order of **one source file** in the host library, encapsulating the new layer class and its supporting state-management helpers.
+
+### 14.2 Construction API (Abstract)
+
+A new builder method should mirror the host library's existing attention construction signature, differing only in the choice of normaliser:
+
+```
+AddKANSelfAttention(
+    Heads: int = 2,                    -- initial active head count
+    HeadCeiling: int = embedding_dim/2,  -- H_max
+    GridLow: float = -8.0,
+    GridHigh: float = 8.0,
+    GridKnots: int = 64,
+    BasisOrder: int = 3,
+    HighClipShare: enum = Auto,
+    LowLiftShare: enum = Auto,
+    SharpeningPower: float = 1.1,
+    KLThreshold: float = 0.01,
+    KLConfirmPasses: int = 100,
+    SquaringClipRate: float = 0.10,
+    SquaringSweeps: int = 64,
+    DisableKANAtInference: bool = false,
+    ForceMode: enum = Auto,
+    PinActiveHeads: int = 0,           -- 0 means use squaring
+    FreezeAfterTakeover: bool = false
+)
+```
+
+The host library's existing `AddSelfAttention` remains unchanged. Both methods can coexist; users opt in to the KAN normaliser by calling the new builder.
+
+### 14.3 Inference-Mode Flag
+
+The host library typically distinguishes training from inference via a `network.inference = true` (or similar) flag set before serving. The KAN attention layer must consult this flag and:
+
+- During training (`inference = false`): forward pass uses softmax exactly; all KAN bookkeeping (steps 6–11 of §7) is **skipped**. Backward pass flows through softmax normally. The layer is functionally identical to the host library's standard attention.
+- During inference (`inference = true`): the full §7 pipeline is engaged.
+
+Switching the flag mid-deployment is supported but should be rare; flipping back to `inference = false` during a deployed run is undefined behaviour in this spec.
+
+### 14.4 Device Placement
+
+This spec targets CPU implementation and assumes the host library's existing CPU code paths. GPU implementation is **not** in v1's scope. The spec's data structures (per-head coefficient arrays, counters, RNG state) are CPU-resident and small enough that this is not a memory-pressure concern even for large models.
+
+A future GPU port would require revisiting §9 (determinism) and §5.5 (NLMS update ordering); the per-coefficient locality of the local rules is friendly to parallelisation but the deterministic ordering guarantees would need to be re-established under GPU execution model.
+
+### 14.5 Logging and Telemetry
+
+Recommended (not mandatory) per-layer telemetry the implementation should expose:
+
+- `KL_ema[head]` — current convergence metric per head.
+- `status[head]` — current phase per head.
+- `clip_rate_ema` — current per-layer clip pressure.
+- `ActiveHeads` — current head count.
+- `clip_count_total[head]` — diagnostic since last reset.
+- Phase transitions (handover, squaring) as discrete events with timestamps.
+
+These are essential for diagnosing deployments and for the "diagnostic value" property of §5.4.9. The host library's existing logging hooks should be reused.
+
+### 14.6 Failure Modes and Operator Guidance
+
+Documented behaviours an operator may observe in production:
+
+| Symptom | Likely cause | Operator response |
+|---|---|---|
+| `KL_ema` plateaus high, never converges | Score range exceeds the spline grid `[s_low, s_high]` | Adjust grid range per layer, reload from retrofit-source checkpoint |
+| `ActiveHeads` reaches `H_max` and `clip_rate_ema` stays high | Layer under-provisioned for data complexity | Architectural change required (more channels), or accept degraded regime |
+| `KL_ema` oscillates around threshold | `N_confirm` too small | Increase `N_confirm`; or use `force_mode = A` to stabilise |
+| Post-takeover task metrics regress | Phase D divergence too aggressive for task | Reduce `α` toward 1.0; or set `freeze_after_takeover = true` |
+| Need to roll back KAN behaviour | Any of the above | Set `disable_kan_at_inference = true` for the affected layer; falls back to standard softmax attention |
+
+---
+
+*End of specification.*
+
+
 
 
 
