@@ -763,6 +763,154 @@ Steps 6–11 add work proportional to `H · L²` (KL computation, NLMS updates) 
 
 A configuration flag may disable Phase M's `w_softmax` computation in step 3 once a head has handed over (skip the redundant softmax). Default: enabled (skip).
 
+---
+
+## 8. State and Checkpointing
+
+### 8.1 Per-Layer State Schema
+
+Every attention layer using this spec carries the following state, which must round-trip through any save/load operation:
+
+| Field | Type / shape | Purpose |
+|---|---|---|
+| `coefficients` | `float[H_max, N]` | B-spline coefficients per head; one row per (possibly inactive) head. |
+| `ActiveHeads` | `int` | Current active head count, `2 ≤ ActiveHeads ≤ H_max`. |
+| `status` | `enum[H_max]` | Per-head phase flag: `SoftmaxActive` or `KANActive`. |
+| `KL_ema` | `float[H_max]` | Per-head convergence EMA (§6.2). |
+| `consecutive_low_passes` | `int[H_max]` | Per-head counter for handover criterion (§6.3). |
+| `clip_rate_ema` | `float` | Per-layer rebalance activity EMA (§5.2.7). |
+| `consecutive_high_sweeps` | `int` | Per-layer counter for squaring criterion (§5.4.3). |
+| `clip_count_total` | `int[H_max]` | Per-head diagnostic counter (§5.2.7). |
+| `rng_state` | `opaque` (per implementation) | Per-layer seeded RNG used for head-split perturbations (§5.4.4) and any other randomness. |
+| `grid_spec` | `(low: float, high: float, knots: int, order: int)` | Immutable B-spline grid configuration. Saved for cross-version compatibility. |
+
+### 8.2 Immutable vs Mutable
+
+- **Immutable** (set at layer construction, never modified): `grid_spec`, `H_max`, the basis function lookup tables (derived from `grid_spec`).
+- **Mutable** (evolves at every inference step): `coefficients`, `KL_ema`, `clip_rate_ema`, all counters, `rng_state`.
+- **Mutable but rare**: `status`, `ActiveHeads`. These change only on handover events and squaring events respectively.
+
+### 8.3 Checkpoint Format
+
+The serialisation format is the host library's existing checkpoint format extended with the fields listed in §8.1. Two binary layouts are supported:
+
+- **Standard mode:** save all of §8.1. Round-trips Phase D state, post-takeover splines, in-flight head squaring, etc. Use for production checkpoints.
+- **Retrofit-source mode:** save only the host library's existing standard layer state (Q/K/V projections, output projection). This is what an externally-trained vanilla softmax model produces. On load into a KAN attention layer, the §8.1 fields are initialised per §8.4.
+
+The two modes are distinguished by a header marker. Loaders auto-detect and dispatch.
+
+### 8.4 Cold-Start Initialisation (Retrofit Path)
+
+When loading a retrofit-source checkpoint into a KAN attention layer:
+
+```
+ActiveHeads             := 2
+status[h]               := SoftmaxActive             for all h
+coefficients[h, :]      := exp_fit_on_grid(grid_spec)  for all h ∈ 0 .. H_max−1
+KL_ema[h]               := +∞                         for all h
+consecutive_low_passes  := 0   for all h
+clip_rate_ema           := 0
+consecutive_high_sweeps := 0
+clip_count_total[h]     := 0
+rng_state               := derived from a deterministic seed function of the
+                            layer's identity (e.g. layer index + grid_spec hash)
+                            so retrofit loads from the same source produce
+                            identical evolution under identical input streams
+```
+
+The first forward pass after a retrofit load produces attention outputs **bit-identical to standard softmax attention** (because all heads are `SoftmaxActive` and `coefficients` are an `exp` fit, but the forward path uses softmax in either case). The deployment can therefore validate correctness on the very first request, before any KAN evolution has occurred.
+
+### 8.5 Save/Load Determinism
+
+A model saved with KAN attention state and reloaded must produce **byte-identical evolution** under any subsequent input sequence (§9). This requires:
+
+- All counters and EMAs are saved at full precision.
+- `rng_state` is saved opaquely such that the RNG produces the same sequence after reload.
+- Floating-point operations on reload are performed in the same order as before save (a property of the host library's general FP determinism guarantees).
+
+### 8.6 Forward Compatibility
+
+`grid_spec` is saved alongside the coefficients to allow cross-version interoperability. A future spec version that changes basis order or knot count must define an upgrade path: re-fit coefficients on the new grid such that the spline output is preserved over the overlap region. v1 does not define this path; it is reserved for future revisions.
+
+### 8.7 Memory Footprint
+
+Per attention layer:
+
+- `coefficients`: `H_max · N` floats. With defaults `H_max ≈ 256`, `N = 64`: `16 384` floats = 64 KB.
+- All counters and EMAs combined: `O(H_max)` ≈ a few KB.
+- Negligible relative to Q/K/V projection weights, which are typically `O(d²)` per layer (e.g. for `d = 512`, `d² = 262 144` floats per projection × 4 projections = 4 MB).
+
+---
+
+## 9. Determinism and Thread Safety
+
+### 9.1 Determinism Property
+
+Given:
+
+- A saved per-layer state `S` (per §8.1).
+- An identical sequence of input batches `(X_1, X_2, …)`.
+
+Two independent runs of an inference deployment using this spec must produce **byte-identical**:
+
+- Forward outputs at every batch.
+- Per-layer state evolution at every batch.
+- Handover events and squaring events at the same batch indices.
+
+This property is essential for: regression testing, debugging, A/B reproducibility, regulatory audit trails, and the integrity of the spec's invariant tests (§13).
+
+### 9.2 Sources of Determinism
+
+The spec achieves bitwise determinism by:
+
+- **No wall-clock reads.** No timing function, no `time()`, `clock()`, or platform-specific timer is consulted in any rule.
+- **No thread-ID leakage.** The rebalance, learning rule, and gauge operations do not branch on thread identity.
+- **No environmental randomness.** No `/dev/urandom`, no platform-RNG calls. All randomness flows from the per-layer seeded `rng_state`.
+- **Fixed iteration order in mechanism #1's cascade** (§5.2.6): row-major over coefficient indices.
+- **Fixed score-update order in NLMS** (§5.5): row-major over the `L × L` attention score matrix, head-major across heads.
+- **Floating-point operations issued in the same sequence on every run.** The host library's existing FP determinism guarantees (e.g. consistent reduction order in vectorised operations) are inherited.
+
+### 9.3 Thread Safety Strategy
+
+The host library runs inference forward passes in parallel across threads in a batch. The KAN attention layer integrates with this in one of two supported strategies (implementation choice; defaults marked):
+
+#### 9.3.1 Strategy A — Batch-Boundary Locking (default)
+
+- Forward passes for samples in a batch run **lock-free** in parallel. Each thread reads the layer's state but does not write.
+- The post-forward bookkeeping (steps 6–11 of §7) is **deferred**. Each thread accumulates `(KL_pass, NLMS update target)` deltas in thread-local buffers.
+- At batch end, a single per-layer write lock is acquired. The accumulated deltas are merged into the layer state in a deterministic order (sample-index-order within the batch). Mechanism #1, gauge, handover check, and squaring check all run once.
+- Lock acquisitions: O(1) per batch per layer.
+
+This strategy preserves determinism (the merge order is fixed and deterministic) and adds negligible overhead (one lock per batch).
+
+#### 9.3.2 Strategy B — Per-Thread Shadow Copies
+
+- Each thread maintains a per-thread shadow copy of the layer state.
+- Forward passes use the shadow copy.
+- Shadow copies are merged at synchronisation points by averaging or last-writer-wins.
+
+More complex; only worth implementing if profiling shows Strategy A's per-batch lock is a measured bottleneck. v1 ships only Strategy A.
+
+### 9.4 Determinism Across Hardware
+
+This spec does not guarantee bitwise determinism **across heterogeneous hardware** (different CPU instruction sets, different SIMD widths, GPU vs CPU). The guarantee is only for runs on the same hardware, same compiler, same library build.
+
+For cross-hardware reproducibility, a stricter mode (round all FP operations to a canonical precision, force a specific FP reduction order) would be required. v1 does not include this; it is noted as a possible v2 extension.
+
+### 9.5 Verification
+
+A deterministic-evolution test is mandatory in the spec's test suite (§13.2):
+
+```
+Given: a saved state S, an input stream X.
+Run 1: load S, replay X, save the resulting state S'_1 and outputs Y_1.
+Run 2: identical to run 1 in a separate process, producing S'_2 and Y_2.
+Assert: S'_1 == S'_2 (bit-identical) and Y_1 == Y_2 (bit-identical).
+```
+
+A failure indicates a determinism leak somewhere in the implementation; the test must be treated as load-bearing infrastructure, not as a soft check.
+
+
 
 
 
