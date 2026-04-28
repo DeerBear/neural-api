@@ -110,5 +110,62 @@ If a head's `KL_ema` never satisfies the convergence criterion (e.g. score distr
 
 A head that remains in Phase M at checkpoint time is saved with `status = SoftmaxActive`; on reload, it resumes mimicry from its current coefficient state.
 
+---
+
+## 5. Core Components
+
+The KAN attention normaliser is composed of five interacting components. Each is described in its own subsection.
+
+### 5.1 B-Spline Normaliser (per head)
+
+**Parametrisation.**
+
+- Each head owns one B-spline `φ : ℝ → ℝ` defined on a fixed grid of knot positions covering the expected range of the attention scores `s_ij = (Q · Kᵀ)_{ij} / √d`.
+- The spline is `φ(s) = Σ_{j=1}^{N} c_j · B_j(s)`, where:
+  - `B_j(·)` are the (immutable) B-spline basis functions of order `k`.
+  - `c_j ∈ ℝ` are the learnable coefficients (the entire mutable state of the head's normaliser).
+  - `N` is the number of knots (basis count).
+
+**Locality.** B-spline basis functions of order `k` have **local support over `k+1` adjacent knot intervals**. Consequently each coefficient `c_j` only influences `φ(s)` for `s` in a small neighbourhood around its knot. This locality is load-bearing for the entire design:
+
+- It defines the natural **window** for mechanism #1 (§5.2): the window of `c_i` is the set of coefficients whose support overlaps `c_i`'s support, naturally `2k+1` coefficients on a uniform grid.
+- It allows the autonomous local learning rule (§6.4) to update only the small subset of coefficients whose basis functions are non-zero at the observed score, keeping per-update cost O(`k+1`) rather than O(`N`).
+
+**Output and normalisation.**
+
+- The forward attention weights are computed by applying `φ` pointwise to every score in the row-major attention matrix and then row-normalising:
+  ```
+  w_ij = φ(s_ij) / Σ_j' φ(s_ij')
+  ```
+- Because the output is row-normalised, **multiplying every coefficient `c_j` by any positive constant leaves `w_ij` unchanged**. This scale-invariance is the gauge freedom exploited by the GM=1 fixing (§5.3).
+- For the output to constitute a valid attention distribution it must be non-negative. A non-negativity constraint on `φ(s)` is required (see §5.1 Constraints below).
+
+**Constraints.**
+
+| Constraint | Reason | Enforcement |
+|---|---|---|
+| `φ(s) ≥ 0` for all `s` in the grid range | Attention weights must be non-negative | Either (a) parametrise the spline as `φ(s) = ψ(s)²` with an underlying spline `ψ`, or (b) accept occasional negative outputs and clip to zero with a small floor `ε_φ`. **Default: option (a).** |
+| Coefficients sign-preserving across rebalance | Stability of the spline shape under mechanism #1 | Mechanism #1's multiplicative redistribution always uses positive factors. |
+| GM=1 per head | Canonical gauge; meaningful thresholds | Renormalisation step in the per-inference pipeline (§7). |
+
+**Initialisation.**
+
+- At layer construction (or first retrofit load), coefficients are fitted such that `φ(s) ≈ exp(s)` over the grid range. A simple least-squares fit on a dense grid of `(s, exp(s))` pairs suffices.
+- Phase M therefore starts with the KAN already approximating softmax. `KL_ema` begins near zero rather than at random, dramatically shortening Phase M for retrofit deployments.
+
+**Grid configuration.**
+
+- Grid range: covers the expected `Q·Kᵀ/√d` range. Default `[−8, +8]` nats; tunable per layer if scores are known to live in a different range.
+- Knot count `N`: trades expressivity for memory. Default `N = 64`. Each head holds `N` floats of state.
+- Basis order `k`: cubic (`k = 3`) by default, giving window size `2k+1 = 7`.
+- Grid is **immutable** for the lifetime of a layer. (A v3 extension may add online grid refinement; not in v1.)
+
+**Memory footprint per head.**
+
+- `N` floats for coefficients.
+- One `N`-sized scratch buffer for evaluation (shared across heads at runtime if memory is tight).
+- Negligible compared to Q/K/V projection weights, which dominate per-layer memory.
+
+
 
 
