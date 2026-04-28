@@ -50,4 +50,65 @@ Consequences of this choice:
 
 **Implementation note (abstract).** The new layer class must, in its training-time forward and backward implementation, be byte-identical in behaviour to the host library's existing softmax attention layer. The KAN-specific state and operations are gated by an `inference-mode` flag that is `false` during training and only flips `true` once the network enters inference. This gating is the single point of departure from the existing layer.
 
+---
+
+## 4. Inference Lifecycle
+
+At inference time, each head of each attention layer progresses independently through three phases. Layers do not have to be in the same phase as one another; per-head state is independent.
+
+### 4.1 Phase M — Mimicry (default on fresh deploy)
+
+- Forward path uses **softmax**.
+- A per-head B-spline `φ(s) = Σ_j c_j · B_j(s)` runs in **shadow** alongside the softmax. It receives every score the softmax sees but its output does not affect the layer's attention weights.
+- An **autonomous local rule** updates the spline coefficients toward the target `exp(s)` (see §6.4 for the rule, §5.1 for the spline parametrisation).
+- A convergence metric `KL(softmax_weights ‖ KAN_weights)` is tracked as an exponential moving average (`KL_ema`).
+- The phase is observation-only from the model's behaviour standpoint: the deployed model's attention outputs are exactly those of the standard softmax model. **There is zero behavioural risk during this phase.**
+
+### 4.2 Phase T — Takeover (atomic transition)
+
+- Triggered when `KL_ema < ε_KL` for at least `N_confirm` consecutive forward passes (see §6 for criteria and defaults).
+- Performed atomically per head per layer:
+  1. The forward path switches from `softmax(s)` to `φ(s) / Σφ(s)`.
+  2. The Phase-M mimicry rule retires.
+  3. The Phase-D divergence rule activates.
+  4. The per-head `status` flag flips from `SoftmaxActive` to `KANActive`.
+- **One-way.** No mechanism reverts a head from `KANActive` back to `SoftmaxActive`. Stability of the post-takeover dynamics is the responsibility of mechanism #1 (§5.2) and head squaring (§5.5).
+- **Per-head independence.** Different heads of the same layer may take over at different times. Different layers progress entirely independently.
+
+### 4.3 Phase D — Divergence (post-takeover)
+
+- Forward path uses the **KAN**.
+- The local rule is no longer mimicry; it is **self-distillation toward a sharpened version of the head's own current attention distribution** (§6.4).
+- Combined with mechanism #1's product-preserving redistribution (§5.2), the sharpening rule cannot grow mass — it can only *redistribute* mass within the head's GM=1 budget. This is the mechanism by which information that softmax would have averaged-out gets concentrated into peaks at score regions that consistently carry signal.
+- Phase D runs **indefinitely**. There is no terminal state; the head keeps adapting to the inference data distribution as long as inference continues.
+
+### 4.4 Lifecycle State Diagram
+
+```
+                          per head, per layer
+
+   ┌──────────────────┐      KL_ema < ε_KL       ┌──────────────────┐
+   │                  │      sustained over      │                  │
+   │     Phase M      │  ──── N_confirm ───▶     │     Phase D      │
+   │     (Mimicry)    │       inferences         │   (Divergence)   │
+   │                  │                          │                  │
+   │ status =         │                          │ status =         │
+   │   SoftmaxActive  │                          │   KANActive      │
+   │ forward = softmax│                          │ forward = KAN    │
+   │ rule = NLMS→exp  │                          │ rule = self-dist │
+   │                  │                          │                  │
+   └──────────────────┘                          └──────────────────┘
+                                                         │
+                                                         │ no transition
+                                                         ▼
+                                                    (terminal)
+```
+
+### 4.5 Non-Convergent Heads
+
+If a head's `KL_ema` never satisfies the convergence criterion (e.g. score distribution is non-stationary or the spline grid is misconfigured for the observed range), the head simply remains in Phase M indefinitely. The layer continues to serve correctly via softmax. This is graceful degradation, not failure.
+
+A head that remains in Phase M at checkpoint time is saved with `status = SoftmaxActive`; on reload, it resumes mimicry from its current coefficient state.
+
+
 
