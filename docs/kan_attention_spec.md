@@ -510,6 +510,95 @@ After every per-inference pipeline step (§7), per layer:
 - **(HS-3)** Inactive heads (index `≥ ActiveHeads`) contribute zero to the layer's forward output.
 - **(HS-4)** Squaring transitions are deterministic given the per-layer RNG state.
 
+### 5.5 Autonomous Local Learning
+
+#### 5.5.1 Premise — No Autograd at Inference
+
+Inference must not require backpropagation, gradient tapes, or any optimiser machinery. The KAN evolves entirely through **autonomous local rules**: each spline coefficient updates from quantities locally observable at the layer (the score being processed, the basis activations, and the local residual). No external loss function is constructed; no gradient flows from anywhere outside the layer.
+
+This constraint is satisfied by exploiting a structural property of B-splines: **`φ` is linear in its coefficients**. For linear-in-parameter models the locally optimal least-squares fit step has a closed form per observation (Normalised LMS / Widrow-Hoff), which can be expressed as a per-coefficient additive update with no gradient machinery.
+
+Mathematically, this rule *is* equivalent to SGD-on-MSE for the linear regression problem; structurally, it is a **cellular update rule each coefficient applies to itself**, with no tape, no graph, and no external orchestrator. That structural distinction is what makes it "autonomous" rather than "SGD in disguise" — it slots into a pure-forward inference pass with no machinery extension.
+
+Two rules exist, one per phase. The *form* is identical (NLMS); only the **target** differs.
+
+#### 5.5.2 Phase M Rule — NLMS Toward `exp(s)`
+
+For each attention score `s` evaluated in a forward pass, while the head's `status = SoftmaxActive`:
+
+```
+target := exp(s)                                          -- pre-normalisation softmax kernel
+y_hat  := φ(s) = Σ_j c_j · B_j(s)
+err    := target − y_hat
+
+denom  := Σ_j B_j(s)² + δ                                  -- δ for stability, e.g. 1e-6
+for each j with B_j(s) ≠ 0:                                -- only k+1 coefficients in support
+    c_j ← c_j + η · B_j(s) · err / denom
+```
+
+**Why fit `exp(s)` rather than `softmax(s)`:** `softmax` involves the row-wise normalisation `/ Σ`, which is non-linear in `φ`'s coefficients (because the denominator depends on all coefficients). Fitting `exp(s)` decouples the local update from the row context — each `(s, exp(s))` pair is independently informative. After takeover, `φ(s) / Σφ(s)` then automatically matches softmax, since `exp(s) / Σexp(s) ≡ softmax(s)`.
+
+**Why NLMS rather than plain LMS:** the denominator `Σ B_j(s)² + δ` makes the update **scale-invariant in the basis activations** at the observed score. This auto-tunes the per-step magnitude — a region of the spline with a high-magnitude basis hit gets the same effective step size as a low-magnitude one. Eliminates the need for a per-region learning-rate schedule.
+
+**Locality of compute:** B-spline locality means only `k+1 = 4` coefficients have non-zero basis activation at any single score `s`. Each NLMS update touches only those `k+1` coefficients. Cost per score: O(`k+1`).
+
+#### 5.5.3 Phase D Rule — Self-Distillation Sharpening
+
+For each attention score `s` evaluated in a forward pass, while the head's `status = KANActive`:
+
+```
+w        := φ(s_i_·) / Σ_j φ(s_i_j)        -- current attention weights for the row containing s
+w_sharp  := w^α / Σ(w^α)                    -- power-α renormalisation, α slightly > 1
+target_s := w_sharp[position(s)] · Σ φ(s_i_·)    -- back into pre-normalisation space
+err      := target_s − φ(s)
+
+denom    := Σ_j B_j(s)² + δ
+for each j with B_j(s) ≠ 0:
+    c_j ← c_j + η · B_j(s) · err / denom
+```
+
+Same NLMS form as Phase M; only the target changes. The target is now derived from the head's **own current attention distribution**, sharpened by raising to a power `α` slightly greater than 1 and re-normalising.
+
+**Default `α = 1.1`.** Each step is a gentle multiplicative emphasis of larger weights at the expense of smaller ones. Mechanism #1 + GM=1 enforce the budget; only the *redistribution* of mass is free.
+
+**Why power-α rather than temperature-scaled softmax:** the temperature variant `softmax(log(w) / τ)` blows up numerically when any `w_i ≈ 0` (because `log w → −∞`). Power-α (`w^α / Σ w^α`) is well-defined for any non-negative `w`, including zeros. Since the spline output enforces `φ ≥ 0` (§5.1), `w` may legitimately be very small but is never undefined.
+
+#### 5.5.4 Why Phase D Surfaces Information Rather Than Collapsing
+
+The Phase D rule, run on its own without any constraint, would push the spline toward a one-hot distribution at the highest-scoring position — losing all attention information. **It does not, because of mechanism #1's product preservation and the GM=1 gauge.**
+
+The dynamic is:
+
+1. The Phase D rule wants to grow peaks (sharpen).
+2. Mechanism #1 preserves per-window `Π |c_j|` (M1-1).
+3. The GM=1 gauge fixes the overall product per head (GM-1).
+4. Therefore peaks **cannot grow** in absolute coefficient magnitude — they can only grow in *relative* magnitude, by drawing mass away from other regions.
+
+This forces a strict mass budget. The KAN cannot simply amplify what softmax already does. To sharpen anywhere, it must flatten elsewhere. The flattening is selective — the Phase D rule pulls mass from regions where the score signal is **inconsistent** (because the additive updates from inconsistent observations cancel) and concentrates it at regions where the score signal is **consistent** (because the updates reinforce).
+
+**Net effect:** the spline learns a shape with multi-modal peaks at score values that consistently carry signal in the actual inference data distribution. Score regions that softmax would have crushed (low-score tokens carrying real information) get carved out as new peaks, drawing mass from regions of the spline that were previously redundant.
+
+**This is the design's answer to "surface information that softmax would lose in a small model."** The combination of (a) shape freedom from B-spline parametrisation, (b) bounded budget from product preservation + gauge, (c) sharpening pressure from self-distillation, and (d) gradient-free local update produces a system that cannot grow without bound but will preferentially concentrate its mass on whatever consistently informative structure the data exhibits.
+
+#### 5.5.5 Cost Analysis
+
+Per forward pass with sequence length `L`, head count `H`, B-spline order `k`:
+
+- **Spline evaluations:** `L²` per head (one per attention score), each O(`k+1`). Total `H · L² · (k+1)` multiply-adds.
+- **NLMS updates:** `L²` per head, each O(`k+1`). Total `H · L² · (k+1)` multiply-adds. Same asymptotic cost as evaluation.
+- **Mechanism #1 sweep:** `H · N · cascade_iters · (2k+1)` multiply-adds. Typically `cascade_iters ≤ 3`. Independent of `L`.
+- **GM=1 gauge:** `H · N` log/exp operations. Independent of `L`.
+
+For typical sequence lengths (`L ≫ N`), the per-pass cost is **dominated by the spline evaluations and updates, both linear in the existing attention's score-matrix cost**. The non-evaluation overhead (mechanism #1 + gauge) is O(`H · N`) per pass, asymptotically free relative to the attention's O(`L² · d`).
+
+#### 5.5.6 Invariants Maintained
+
+- **(LL-1)** Each NLMS update touches at most `k+1` coefficients per score — the ones with non-zero basis activation at `s`.
+- **(LL-2)** The update is deterministic given `(s, target, denom, η, current coefficients)`.
+- **(LL-3)** The update is sign-preserving in expectation (single-step updates can flip sign in pathological cases; mechanism #1 immediately corrects via low-lift).
+- **(LL-4)** No gradient state, no optimiser state, no autograd graph is constructed at any point.
+
+
 
 
 
