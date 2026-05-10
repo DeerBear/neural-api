@@ -40,8 +40,14 @@ uses
 type
   /// Per-head B-spline normaliser. Drop-in replacement for the per-head
   /// TNNetPointwiseSoftMax inside multi-head self-attention. Inherits
-  /// TNNetIdentity for output-shape and gradient-routing plumbing.
-  TNNetKANNormaliser = class(TNNetIdentity)
+  /// TNNetPointwiseSoftMax so that:
+  ///   - In training mode (FInferenceMode = false) or when KAN is
+  ///     disabled (FKANEnabled = false), Compute and Backpropagate
+  ///     fall through to standard softmax behaviour for free.
+  ///   - In inference mode with KANEnabled = true, Compute runs the
+  ///     §7 KAN pipeline. Backpropagate raises EKANInInference (the
+  ///     spec forbids backprop while KAN is active; §5.5.1).
+  TNNetKANNormaliser = class(TNNetPointwiseSoftMax)
   private
     // --- Identity ---
     FAttentionLayerId: integer;
@@ -140,7 +146,10 @@ constructor TNNetKANNormaliser.Create(const GridSpec: TKANGridSpec;
                                        const SharedBasis: TKANBasis;
                                        const SharedRNG: PKANSeededRNG);
 begin
-  inherited Create;
+  // Standard softmax behaviour as the base; KAN augmentation kicks in
+  // when InferenceMode and KANEnabled are both true.
+  // SkipBackpropDerivative=0, NoForward=0 — both default behaviours.
+  inherited Create(0, 0);
 
   FAttentionLayerId := AttentionLayerId;
   FHeadIndex := HeadIndex;
@@ -222,8 +231,14 @@ end;
 
 procedure TNNetKANNormaliser.ComputeAsSoftmax;
 begin
-  // TODO: reproduce TNNetPointwiseSoftMax.Compute behaviour on FPrevLayer.Output
-  raise EKANBadState.Create('TNNetKANNormaliser.ComputeAsSoftmax: not implemented');
+  // Inherits from TNNetPointwiseSoftMax — its Compute copies input to
+  // output (TNNetIdentity behaviour) then applies row-wise softmax.
+  // No KAN bookkeeping, no per-head state mutation. Used:
+  //   - during training (FInferenceMode = false), so the layer behaves
+  //     identically to the original softmax it replaces;
+  //   - when this layer's KANEnabled is false (selective-deployment
+  //     opt-out, spec §11.8 / impl doc §4.6).
+  inherited Compute;
 end;
 
 function TNNetKANNormaliser.SaveDataToString: string;
