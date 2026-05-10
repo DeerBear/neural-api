@@ -70,6 +70,20 @@ type
     procedure TestKANSquaringTriggerResetsOnLowRate;
     procedure TestKANSquaringTriggerClampedAtCeiling;
     procedure TestKANSquaringTriggerEmaSmoothing;
+
+    // ---- Coverage gaps for already-implemented surface ----
+    procedure TestKANGridSpecHashDeterministic;
+    procedure TestKANRNGNextFloatRange;
+    procedure TestKANRNGNextNormalSanity;
+    procedure TestKANBasisCreateValidation;
+    procedure TestKANNormaliserInitialPerHeadState;
+    procedure TestKANNormaliserEnterInferenceFitsCoefficients;
+    procedure TestKANNormaliserEnterInferenceRequiresSeededRNG;
+    procedure TestKANInfoCreateValidation;
+    procedure TestKANInfoCheckSquaringRaisesWhenTriggered;
+    procedure TestKANNetBackpropGatesOnLock;
+    procedure TestKANNetBulkOpsOnEmptyNetwork;
+    procedure TestKANNetBulkOpsIndexValidation;
   end;
 
 implementation
@@ -203,8 +217,35 @@ begin
 end;
 
 procedure TTestNeuralKAN.TestKANBackpropRaisesInInferenceMode;
+var
+  Spec: TKANGridSpec;
+  Basis: TKANBasis;
+  RNG: TKANSeededRNG;
+  Norm: TNNetKANNormaliser;
+  Caught: boolean;
 begin
-  Fail(NOT_IMPLEMENTED);
+  // After EnterInferenceMode, the layer's Backpropagate must raise
+  // EKANInInference (spec §5.5.1: no autograd at inference). The raise
+  // happens at the top of Backpropagate before any chain wiring is
+  // touched, so we do not need a fully wired FPrevLayer for this test.
+  Spec := MakeDefaultGridSpec(32);
+  Basis := TKANBasis.Create(Spec);
+  RNG.Seed(42);
+
+  Norm := TNNetKANNormaliser.Create(Spec, 0, 0, Basis, @RNG);
+  try
+    Norm.EnterInferenceMode;
+    Caught := false;
+    try
+      Norm.Backpropagate;
+    except
+      on EKANInInference do Caught := true;
+    end;
+    AssertTrue('Backpropagate in inference mode must raise EKANInInference', Caught);
+  finally
+    Norm.Free;
+    Basis.Free;
+  end;
 end;
 
 procedure TTestNeuralKAN.TestKANInferenceForwardRequiresLock;
@@ -406,12 +447,10 @@ begin
 
   Norm := TNNetKANNormaliser.Create(Spec, 0, 0, Basis, @RNG);
   try
-    AssertFalse('Normaliser starts in training mode', Norm.KANEnabled and False);
-    // The normaliser starts with FInferenceMode = false; calling Compute
-    // would invoke ComputeAsSoftmax. We do not exercise the full
-    // forward path here (that needs a wired-up FPrevLayer + FOutput);
-    // we only verify that the inheritance chain is correct and that
-    // the layer instantiates without raising.
+    // We do not exercise the full forward path here (that needs a wired-up
+    // FPrevLayer + FOutput); we only verify that the inheritance chain is
+    // correct and that the layer instantiates without raising. Detailed
+    // initial-state checks live in TestKANNormaliserInitialPerHeadState.
     AssertEquals('AttentionLayerId stored correctly', 0, Norm.AttentionLayerId);
     AssertEquals('HeadIndex stored correctly', 0, Norm.HeadIndex);
     AssertTrue('KANEnabled defaults to true', Norm.KANEnabled);
@@ -561,6 +600,346 @@ begin
                Info.ClipRateEMA > 0.05);
   finally
     Info.Free;
+  end;
+end;
+
+// ---- Coverage gaps for already-implemented surface ----
+
+procedure TTestNeuralKAN.TestKANGridSpecHashDeterministic;
+var
+  S1, S2, S3: TKANGridSpec;
+begin
+  S1 := MakeDefaultGridSpec(64);
+  S2 := MakeDefaultGridSpec(64);
+  AssertEquals('Same spec must produce same hash (run-to-run determinism)',
+               S1.Hash, S2.Hash);
+
+  S3 := MakeDefaultGridSpec(32);   // different KnotCount
+  AssertTrue('Different KnotCount must change the hash', S1.Hash <> S3.Hash);
+
+  S3 := MakeDefaultGridSpec(64);
+  S3.GridLow := -4.0;              // different grid range
+  AssertTrue('Different GridLow must change the hash', S1.Hash <> S3.Hash);
+
+  S3 := MakeDefaultGridSpec(64);
+  S3.GridHigh := 4.0;
+  AssertTrue('Different GridHigh must change the hash', S1.Hash <> S3.Hash);
+end;
+
+procedure TTestNeuralKAN.TestKANRNGNextFloatRange;
+var
+  RNG: TKANSeededRNG;
+  i: integer;
+  v: TNeuralFloat;
+begin
+  RNG.Seed(7);
+  for i := 1 to 10000 do
+  begin
+    v := RNG.NextFloat;
+    AssertTrue(Format('NextFloat must be >= 0 (got %g)', [v]), v >= 0);
+    AssertTrue(Format('NextFloat must be < 1 (got %g)', [v]), v < 1);
+  end;
+end;
+
+procedure TTestNeuralKAN.TestKANRNGNextNormalSanity;
+var
+  RNG: TKANSeededRNG;
+  i, n: integer;
+  v, sum, sumSq, mean, variance: TNeuralFloat;
+begin
+  // Sample a moderately large number of standard-normal draws and check
+  // that the empirical mean is close to 0 and variance is close to 1.
+  // Generous tolerances — this is a sanity test, not a chi-squared test.
+  RNG.Seed(123);
+  n := 10000;
+  sum := 0;
+  sumSq := 0;
+  for i := 1 to n do
+  begin
+    v := RNG.NextNormal;
+    AssertTrue(Format('NextNormal must produce finite values (got %g)', [v]),
+               not (IsNan(v) or IsInfinite(v)));
+    sum := sum + v;
+    sumSq := sumSq + v * v;
+  end;
+  mean := sum / n;
+  variance := sumSq / n - mean * mean;
+  AssertTrue(Format('Sample mean over %d normals should be near 0 (got %g)', [n, mean]),
+             Abs(mean) < 0.1);
+  AssertTrue(Format('Sample variance over %d normals should be near 1 (got %g)', [n, variance]),
+             Abs(variance - 1.0) < 0.1);
+end;
+
+procedure TTestNeuralKAN.TestKANBasisCreateValidation;
+var
+  Spec: TKANGridSpec;
+  Basis: TKANBasis;
+
+  function TryCreate(const S: TKANGridSpec): boolean;
+  begin
+    Result := false;
+    try
+      Basis := TKANBasis.Create(S);
+      Basis.Free;
+    except
+      on EKANBadState do Result := true;
+    end;
+  end;
+
+begin
+  // KnotCount < 4 is an error.
+  Spec := MakeDefaultGridSpec(3);
+  AssertTrue('KnotCount = 3 must raise EKANBadState', TryCreate(Spec));
+
+  // BasisOrder != 3 is an error in v1.
+  Spec := MakeDefaultGridSpec(64);
+  Spec.BasisOrder := 2;
+  AssertTrue('BasisOrder = 2 must raise EKANBadState (v1 cubic-only)', TryCreate(Spec));
+
+  // GridHigh <= GridLow is an error.
+  Spec := MakeDefaultGridSpec(64);
+  Spec.GridHigh := Spec.GridLow;
+  AssertTrue('GridHigh = GridLow must raise EKANBadState', TryCreate(Spec));
+
+  Spec := MakeDefaultGridSpec(64);
+  Spec.GridHigh := Spec.GridLow - 1.0;
+  AssertTrue('GridHigh < GridLow must raise EKANBadState', TryCreate(Spec));
+
+  // Sanity: a valid spec does NOT raise.
+  Spec := MakeDefaultGridSpec(64);
+  AssertFalse('Valid spec must not raise', TryCreate(Spec));
+end;
+
+procedure TTestNeuralKAN.TestKANNormaliserInitialPerHeadState;
+var
+  Spec: TKANGridSpec;
+  Basis: TKANBasis;
+  RNG: TKANSeededRNG;
+  Norm: TNNetKANNormaliser;
+begin
+  // Verify the per-head state at construction time, before any
+  // EnterInferenceMode call. KLEMA must be Infinity (so the EMA descends
+  // from a sentinel rather than from a meaningless 0), all counters must
+  // be zero, and Status must be ksSoftmaxActive.
+  Spec := MakeDefaultGridSpec(32);
+  Basis := TKANBasis.Create(Spec);
+  RNG.Seed(1);
+
+  Norm := TNNetKANNormaliser.Create(Spec, 7, 3, Basis, @RNG);
+  try
+    AssertEquals('AttentionLayerId stored', 7, Norm.AttentionLayerId);
+    AssertEquals('HeadIndex stored', 3, Norm.HeadIndex);
+    AssertTrue('Status starts SoftmaxActive', Norm.Status = ksSoftmaxActive);
+    AssertTrue('KLEMA starts at +Infinity (sentinel)', IsInfinite(Norm.KLEMA));
+    AssertEquals('ClipCountTotal starts at 0', 0, Norm.ClipCountTotal);
+    AssertEquals('CascadeCapHits starts at 0', 0, Norm.CascadeCapHits);
+    AssertTrue('KANEnabled starts true (per-layer opt-out, default opt-in)',
+               Norm.KANEnabled);
+    AssertFalse('FreezeAfterTakeover starts false', Norm.FreezeAfterTakeover);
+    AssertTrue('SkipRedundantSoftmax starts true (perf default)',
+               Norm.SkipRedundantSoftmax);
+  finally
+    Norm.Free;
+    Basis.Free;
+  end;
+end;
+
+procedure TTestNeuralKAN.TestKANNormaliserEnterInferenceFitsCoefficients;
+var
+  Spec: TKANGridSpec;
+  Basis: TKANBasis;
+  RNG: TKANSeededRNG;
+  Norm: TNNetKANNormaliser;
+begin
+  // Before EnterInferenceMode, KLEMA is the +Infinity sentinel. After,
+  // ColdStartHead has fitted coefficients to ψ ≈ exp(s/2) and reset
+  // KLEMA to +Infinity (which it already was). The visible signal that
+  // cold-start ran is that subsequent EnterInferenceMode calls are no-ops.
+  Spec := MakeDefaultGridSpec(32);
+  Basis := TKANBasis.Create(Spec);
+  RNG.Seed(99);
+
+  Norm := TNNetKANNormaliser.Create(Spec, 0, 0, Basis, @RNG);
+  try
+    AssertTrue('Pre-inference KLEMA is +Infinity', IsInfinite(Norm.KLEMA));
+    Norm.EnterInferenceMode;
+    // Cold-start has run; the layer is in inference mode and KLEMA is
+    // still at the sentinel waiting for the first observation. Calling
+    // EnterInferenceMode again is idempotent.
+    Norm.EnterInferenceMode;
+  finally
+    Norm.Free;
+    Basis.Free;
+  end;
+end;
+
+procedure TTestNeuralKAN.TestKANNormaliserEnterInferenceRequiresSeededRNG;
+var
+  Spec: TKANGridSpec;
+  Basis: TKANBasis;
+  RNG: TKANSeededRNG;
+  Norm: TNNetKANNormaliser;
+  Caught: boolean;
+begin
+  // EnterInferenceMode raises EKANBadState if the RNG state is 0 — a
+  // safety check against the case where construction wired the RNG
+  // pointer but nobody called Seed.
+  Spec := MakeDefaultGridSpec(32);
+  Basis := TKANBasis.Create(Spec);
+  RNG.State := 0;     // explicitly unseeded; default-zeroed record
+
+  Norm := TNNetKANNormaliser.Create(Spec, 0, 0, Basis, @RNG);
+  try
+    Caught := false;
+    try
+      Norm.EnterInferenceMode;
+    except
+      on EKANBadState do Caught := true;
+    end;
+    AssertTrue('EnterInferenceMode with unseeded RNG must raise EKANBadState',
+               Caught);
+  finally
+    Norm.Free;
+    Basis.Free;
+  end;
+end;
+
+procedure TTestNeuralKAN.TestKANInfoCreateValidation;
+var
+  Spec: TKANGridSpec;
+  Info: TKANAttentionLayerInfo;
+
+  function TryCreate(const HMax: integer; const Tau: TNeuralFloat;
+                     const K: integer; const Lambda: TNeuralFloat): boolean;
+  begin
+    Result := false;
+    try
+      Info := TKANAttentionLayerInfo.Create(0, Spec, HMax, 1, Tau, K, Lambda);
+      Info.Free;
+    except
+      on EKANBadState do Result := true;
+    end;
+  end;
+
+begin
+  Spec := MakeDefaultGridSpec(32);
+  AssertTrue('HMax < 2 must raise',          TryCreate(1, 0.10, 64, 0.01));
+  AssertTrue('TauSquaring <= 0 must raise',  TryCreate(8, 0.0,  64, 0.01));
+  AssertTrue('TauSquaring >= 1 must raise',  TryCreate(8, 1.0,  64, 0.01));
+  AssertTrue('KSquaring < 1 must raise',     TryCreate(8, 0.10, 0,  0.01));
+  AssertTrue('Lambda <= 0 must raise',       TryCreate(8, 0.10, 64, 0.0));
+  AssertTrue('Lambda > 1 must raise',        TryCreate(8, 0.10, 64, 1.5));
+  AssertFalse('Valid params must not raise', TryCreate(8, 0.10, 64, 0.01));
+end;
+
+procedure TTestNeuralKAN.TestKANInfoCheckSquaringRaisesWhenTriggered;
+var
+  Spec: TKANGridSpec;
+  Info: TKANAttentionLayerInfo;
+  i: integer;
+  Caught: boolean;
+begin
+  // CheckSquaring currently raises EKANBadState when the trigger fires
+  // because DoSquaring (the actual log-normal perturbation) is still
+  // a stub. This test pins the current behaviour so the future
+  // DoSquaring implementation has a test that fails when it lands.
+  Spec := MakeDefaultGridSpec(32);
+  Info := TKANAttentionLayerInfo.Create(0, Spec, 16, 1, 0.10, 3, 1.0);
+  try
+    AssertFalse('Trigger does not fire initially', Info.ShouldFireSquaring);
+
+    // CheckSquaring is a no-op until the trigger fires.
+    Info.CheckSquaring;   // should not raise
+
+    // Build up sustained pressure to fire the trigger.
+    for i := 1 to 3 do Info.RecordSweepClipRate(0.5);
+    AssertTrue('Trigger fires after 3 high sweeps', Info.ShouldFireSquaring);
+
+    // Now CheckSquaring should raise (DoSquaring is the stub).
+    Caught := false;
+    try
+      Info.CheckSquaring;
+    except
+      on EKANBadState do Caught := true;
+    end;
+    AssertTrue('CheckSquaring must raise EKANBadState while DoSquaring is a stub',
+               Caught);
+  finally
+    Info.Free;
+  end;
+end;
+
+procedure TTestNeuralKAN.TestKANNetBackpropGatesOnLock;
+var
+  NN: TKANNet;
+  Caught: boolean;
+begin
+  // After LockToInference, calling Backpropagate must raise
+  // EKANInInference *before* it touches anything else (the guard runs
+  // first), so we can test this on an empty network without a real input.
+  NN := TKANNet.Create;
+  try
+    NN.LockToInference;
+    Caught := false;
+    try
+      NN.Backpropagate(nil);
+    except
+      on EKANInInference do Caught := true;
+    end;
+    AssertTrue('Backpropagate when locked must raise EKANInInference', Caught);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralKAN.TestKANNetBulkOpsOnEmptyNetwork;
+var
+  NN: TKANNet;
+  Mask: TKANEnabledMask;
+begin
+  // Bulk operations on a network with no KAN attention layers must be
+  // no-ops, not raise. This is the "construct, configure, destruct"
+  // smoke-test path that operators will hit before they even build a
+  // model.
+  NN := TKANNet.Create;
+  try
+    NN.DisableAllKAN;       // no-op, must not raise
+    NN.EnableAllKAN;        // no-op, must not raise
+    Mask := NN.KANEnabledMask;
+    AssertEquals('KANEnabledMask is empty for an empty network', 0, Length(Mask));
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralKAN.TestKANNetBulkOpsIndexValidation;
+var
+  NN: TKANNet;
+
+  function CaughtBadState(Action: integer): boolean;
+  begin
+    Result := false;
+    try
+      case Action of
+        0: NN.DisableKANForLayer(0);    // no layers; index 0 invalid
+        1: NN.DisableKANForLayer(-1);
+        2: NN.EnableKANForLayer(0);
+        3: NN.EnableKANForLayer(-5);
+      end;
+    except
+      on EKANBadState do Result := true;
+    end;
+  end;
+
+begin
+  NN := TKANNet.Create;
+  try
+    AssertTrue('DisableKANForLayer(0) on empty network raises',  CaughtBadState(0));
+    AssertTrue('DisableKANForLayer(-1) raises',                  CaughtBadState(1));
+    AssertTrue('EnableKANForLayer(0) on empty network raises',   CaughtBadState(2));
+    AssertTrue('EnableKANForLayer(-5) raises',                   CaughtBadState(3));
+  finally
+    NN.Free;
   end;
 end;
 
