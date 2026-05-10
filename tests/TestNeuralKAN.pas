@@ -63,6 +63,13 @@ type
 
     // ---- Softmax fallback (impl doc §5.1) ----
     procedure TestKANNormaliserSoftmaxFallbackInTraining;
+
+    // ---- Squaring trigger (spec §5.4.3) ----
+    procedure TestKANSquaringTriggerNotFiringInitially;
+    procedure TestKANSquaringTriggerFiresAfterSustainedHighRate;
+    procedure TestKANSquaringTriggerResetsOnLowRate;
+    procedure TestKANSquaringTriggerClampedAtCeiling;
+    procedure TestKANSquaringTriggerEmaSmoothing;
   end;
 
 implementation
@@ -268,7 +275,7 @@ begin
   try
     // Pick an interior score (well away from boundaries).
     s := 0.5;
-    Basis.Evaluate(s, FirstIdx, @Vals[0]);
+    Basis.Evaluate(s, FirstIdx, Vals);
     NonZeroCount := 0;
     for i := 0 to 3 do
       if Vals[i] > 0 then Inc(NonZeroCount);
@@ -296,7 +303,7 @@ begin
     for i := 0 to 49 do
     begin
       s := -7.5 + i * (15.0 / 49);
-      Basis.Evaluate(s, FirstIdx, @Vals[0]);
+      Basis.Evaluate(s, FirstIdx, Vals);
       for j := 0 to 3 do
         AssertTrue(Format('Basis value at s=%.3f index %d must be >= 0 (got %.6f)',
                           [s, j, Vals[j]]),
@@ -323,7 +330,7 @@ begin
     for i := 0 to 19 do
     begin
       s := -6.0 + i * (12.0 / 19);
-      Basis.Evaluate(s, FirstIdx, @Vals[0]);
+      Basis.Evaluate(s, FirstIdx, Vals);
       total := 0;
       for j := 0 to 3 do total := total + Vals[j];
       AssertTrue(Format('Interior partition-of-unity at s=%.3f: sum=%.6f, expected ~1.0',
@@ -356,7 +363,7 @@ begin
     for i := 1 to 60 do
     begin
       s := -6.0 + i * (12.0 / 60);
-      Basis.Evaluate(s, FirstIdx, @Vals[0]);
+      Basis.Evaluate(s, FirstIdx, Vals);
       psi := 0;
       for j := 0 to 3 do
       begin
@@ -419,6 +426,142 @@ begin
   // alongside the §7 pipeline implementation (one of the IT-Retrofit
   // checks). This test only verifies the layer instantiates with the
   // softmax inheritance correctly in place.
+end;
+
+// ---- Squaring trigger ----
+
+procedure TTestNeuralKAN.TestKANSquaringTriggerNotFiringInitially;
+var
+  Spec: TKANGridSpec;
+  Info: TKANAttentionLayerInfo;
+begin
+  Spec := MakeDefaultGridSpec(32);
+  // Defaults: TauSquaring = 0.10, KSquaring = 64.
+  Info := TKANAttentionLayerInfo.Create(0, Spec, 16, 1);
+  try
+    AssertEquals('Initial ActiveHeads = 2 per spec §5.4.2', 2, Info.ActiveHeads);
+    AssertEquals('Initial ConsecutiveHighSweeps = 0', 0, Info.ConsecutiveHighSweeps);
+    AssertFalse('Trigger does not fire on a fresh layer', Info.ShouldFireSquaring);
+  finally
+    Info.Free;
+  end;
+end;
+
+procedure TTestNeuralKAN.TestKANSquaringTriggerFiresAfterSustainedHighRate;
+var
+  Spec: TKANGridSpec;
+  Info: TKANAttentionLayerInfo;
+  i: integer;
+begin
+  Spec := MakeDefaultGridSpec(32);
+  // Use a faster EMA so a small constant high signal pushes the EMA above
+  // τ_squaring quickly; smaller KSquaring so the test runs in few iterations.
+  // ClipRateEmaLambda = 1.0 makes the EMA equal to the instantaneous value.
+  Info := TKANAttentionLayerInfo.Create(0, Spec, 16, 1,
+                                         0.10,   // TauSquaring
+                                         5,      // KSquaring
+                                         1.0);   // ClipRateEmaLambda (no smoothing)
+  try
+    // Feed K_squaring - 1 = 4 sustained high rates: trigger should not fire yet.
+    for i := 1 to 4 do
+    begin
+      Info.RecordSweepClipRate(0.5);   // well above τ = 0.10
+      AssertFalse(Format('After %d high sweeps (need 5), trigger not yet firing', [i]),
+                  Info.ShouldFireSquaring);
+    end;
+    // The 5th high sweep crosses the threshold.
+    Info.RecordSweepClipRate(0.5);
+    AssertEquals('After 5 high sweeps, ConsecutiveHighSweeps = 5',
+                 5, Info.ConsecutiveHighSweeps);
+    AssertTrue('Trigger fires on the K_squaring-th sustained high sweep',
+               Info.ShouldFireSquaring);
+  finally
+    Info.Free;
+  end;
+end;
+
+procedure TTestNeuralKAN.TestKANSquaringTriggerResetsOnLowRate;
+var
+  Spec: TKANGridSpec;
+  Info: TKANAttentionLayerInfo;
+  i: integer;
+begin
+  Spec := MakeDefaultGridSpec(32);
+  Info := TKANAttentionLayerInfo.Create(0, Spec, 16, 1, 0.10, 5, 1.0);
+  try
+    // Build up some high-pressure history.
+    for i := 1 to 3 do Info.RecordSweepClipRate(0.5);
+    AssertEquals('Counter built up to 3', 3, Info.ConsecutiveHighSweeps);
+
+    // A single low-pressure sweep wipes the counter — sustained-pressure
+    // semantics. The next high sweep starts the counter from 1, not 4.
+    Info.RecordSweepClipRate(0.0);
+    AssertEquals('Single low sweep resets ConsecutiveHighSweeps to 0',
+                 0, Info.ConsecutiveHighSweeps);
+
+    Info.RecordSweepClipRate(0.5);
+    AssertEquals('Resumed pressure starts counter from 1, not from previous',
+                 1, Info.ConsecutiveHighSweeps);
+    AssertFalse('Trigger does not fire after the reset+1', Info.ShouldFireSquaring);
+  finally
+    Info.Free;
+  end;
+end;
+
+procedure TTestNeuralKAN.TestKANSquaringTriggerClampedAtCeiling;
+var
+  Spec: TKANGridSpec;
+  Info: TKANAttentionLayerInfo;
+  i: integer;
+begin
+  // HMax = 2 means the layer is already at the ceiling at construction
+  // (initial ActiveHeads = 2). Even with sustained pressure, the trigger
+  // must not fire — there is nowhere to grow. (HS-1: 2 ≤ ActiveHeads ≤ HMax.)
+  Spec := MakeDefaultGridSpec(32);
+  Info := TKANAttentionLayerInfo.Create(0, Spec, 2, 1, 0.10, 5, 1.0);
+  try
+    AssertEquals('At-ceiling: ActiveHeads = HMax', Info.HMax, Info.ActiveHeads);
+    for i := 1 to 20 do Info.RecordSweepClipRate(0.9);   // very high, sustained
+    AssertTrue('Counter still accumulates even at ceiling',
+               Info.ConsecutiveHighSweeps >= 5);
+    AssertFalse('Trigger does not fire when ActiveHeads = HMax',
+                Info.ShouldFireSquaring);
+  finally
+    Info.Free;
+  end;
+end;
+
+procedure TTestNeuralKAN.TestKANSquaringTriggerEmaSmoothing;
+var
+  Spec: TKANGridSpec;
+  Info: TKANAttentionLayerInfo;
+  i: integer;
+begin
+  // With a small λ (default 0.01), a single high sweep does not push the
+  // EMA above τ_squaring. The counter should stay at 0 until many sweeps
+  // have accumulated to push the EMA past the threshold.
+  Spec := MakeDefaultGridSpec(32);
+  Info := TKANAttentionLayerInfo.Create(0, Spec, 16, 1,
+                                         0.10,   // TauSquaring
+                                         64,     // KSquaring
+                                         0.01);  // realistic EMA smoothing
+  try
+    // After 1 high sweep, EMA = 0.99·0 + 0.01·0.5 = 0.005, well below 0.10.
+    Info.RecordSweepClipRate(0.5);
+    AssertTrue(Format('Single high sweep does not push EMA above threshold (got EMA=%g)',
+                      [Info.ClipRateEMA]),
+               Info.ClipRateEMA < 0.10);
+    AssertEquals('Counter is still 0 after one high sweep', 0,
+                 Info.ConsecutiveHighSweeps);
+
+    // Feed many high sweeps and check the EMA grows.
+    for i := 1 to 50 do Info.RecordSweepClipRate(0.5);
+    AssertTrue(Format('After 51 high sweeps, EMA should be substantial (got %g)',
+                      [Info.ClipRateEMA]),
+               Info.ClipRateEMA > 0.05);
+  finally
+    Info.Free;
+  end;
 end;
 
 initialization

@@ -44,33 +44,72 @@ type
 
   /// Tracks the H_max normalisers and shared resources for one
   /// attention layer in a TKANNet. Owned by the network.
+  ///
+  /// Per-attention-layer state covered:
+  ///   - the shared B-spline basis and seeded RNG (one of each per layer)
+  ///   - the registry of H_max TNNetKANNormaliser instances (one per head sub-path)
+  ///   - the squaring trigger machinery: clip-rate EMA and the
+  ///     consecutive-high-sweeps counter (spec §5.4.3)
   TKANAttentionLayerInfo = class
   private
     FAttentionLayerId: integer;
     FBasis: TKANBasis;
     FRNG: TKANSeededRNG;
+
+    // --- Pre-allocation and squaring (spec §5.4) ---
+    FHMax: integer;
     FActiveHeads: integer;
-    FClipRateEMA: TNeuralFloat;
-    FConsecutiveHighSweeps: integer;
+
+    // --- Squaring trigger machinery (spec §5.4.3) ---
+    FClipRateEMA: TNeuralFloat;            // EMA of per-sweep clip-or-lift fraction
+    FClipRateEmaLambda: TNeuralFloat;      // EMA decay; default 0.01 (spec §6.2 horizon)
+    FTauSquaring: TNeuralFloat;            // clip-rate threshold; default 0.10
+    FKSquaring: integer;                   // sustained sweeps required; default 64
+    FConsecutiveHighSweeps: integer;       // current run of sweeps above τ_squaring
+
     FNormalisers: TList;               // of TNNetKANNormaliser; length = H_max
   public
     constructor Create(const AttentionLayerId: integer;
                        const Spec: TKANGridSpec;
                        const HMax: integer;
-                       const Seed: UInt64);
+                       const Seed: UInt64;
+                       const TauSquaring: TNeuralFloat = 0.10;
+                       const KSquaring: integer = 64;
+                       const ClipRateEmaLambda: TNeuralFloat = 0.01);
     destructor Destroy; override;
 
     procedure RegisterNormaliser(const N: TNNetKANNormaliser);
 
-    /// Per-attention-layer post-batch hook: reads each normaliser's
-    /// per-head clip activity, updates FClipRateEMA, fires squaring if
-    /// criterion is met (spec §5.4.3, §7 step 11).
+    /// Update the per-layer FClipRateEMA from the fraction of coefficients
+    /// that fired clip-or-lift in the most recent mechanism-#1 sweep
+    /// (across all *active* heads in this attention layer). Also updates
+    /// FConsecutiveHighSweeps according to whether the new EMA is above
+    /// FTauSquaring. Call once per Compute pass per attention layer
+    /// (spec §5.2.7, §5.4.3).
+    procedure RecordSweepClipRate(const SweepClipRate: TNeuralFloat);
+
+    /// Returns true if the squaring criterion is currently met:
+    ///   FActiveHeads < FHMax  AND  FConsecutiveHighSweeps >= FKSquaring.
+    /// The caller (typically TKANNet at §7 step 11) is responsible for
+    /// having previously called RecordSweepClipRate to update the running
+    /// counters. Returns false once FActiveHeads = FHMax (no more room)
+    /// or while pressure has not been sustained for FKSquaring sweeps.
+    function ShouldFireSquaring: boolean;
+
+    /// Per-attention-layer post-batch hook: checks the squaring criterion
+    /// and fires squaring if met. To be called by TKANNet at §7 step 11.
+    /// (The actual squaring operation — log-normal perturbation of newly-
+    /// active heads — is still a stub.)
     procedure CheckSquaring;
 
     property AttentionLayerId: integer read FAttentionLayerId;
     property Basis: TKANBasis read FBasis;
+    property HMax: integer read FHMax;
     property ActiveHeads: integer read FActiveHeads;
     property ClipRateEMA: TNeuralFloat read FClipRateEMA;
+    property ConsecutiveHighSweeps: integer read FConsecutiveHighSweeps;
+    property TauSquaring: TNeuralFloat read FTauSquaring;
+    property KSquaring: integer read FKSquaring;
     property Normalisers: TList read FNormalisers;
   end;
 
@@ -144,15 +183,40 @@ implementation
 constructor TKANAttentionLayerInfo.Create(const AttentionLayerId: integer;
                                            const Spec: TKANGridSpec;
                                            const HMax: integer;
-                                           const Seed: UInt64);
+                                           const Seed: UInt64;
+                                           const TauSquaring: TNeuralFloat;
+                                           const KSquaring: integer;
+                                           const ClipRateEmaLambda: TNeuralFloat);
 begin
   inherited Create;
+
+  if HMax < 2 then
+    raise EKANBadState.CreateFmt(
+      'TKANAttentionLayerInfo.Create: HMax must be >= 2 (got %d)', [HMax]);
+  if (TauSquaring <= 0) or (TauSquaring >= 1) then
+    raise EKANBadState.CreateFmt(
+      'TKANAttentionLayerInfo.Create: TauSquaring must be in (0,1), got %g', [TauSquaring]);
+  if KSquaring < 1 then
+    raise EKANBadState.CreateFmt(
+      'TKANAttentionLayerInfo.Create: KSquaring must be >= 1 (got %d)', [KSquaring]);
+  if (ClipRateEmaLambda <= 0) or (ClipRateEmaLambda > 1) then
+    raise EKANBadState.CreateFmt(
+      'TKANAttentionLayerInfo.Create: ClipRateEmaLambda must be in (0,1], got %g',
+      [ClipRateEmaLambda]);
+
   FAttentionLayerId := AttentionLayerId;
   FBasis := TKANBasis.Create(Spec);
   FRNG.Seed(Seed);
+
+  FHMax := HMax;
   FActiveHeads := 2;                    // spec-mandated initial value (§5.4.2)
+
   FClipRateEMA := 0;
+  FClipRateEmaLambda := ClipRateEmaLambda;
+  FTauSquaring := TauSquaring;
+  FKSquaring := KSquaring;
   FConsecutiveHighSweeps := 0;
+
   FNormalisers := TList.Create;
 end;
 
@@ -168,12 +232,39 @@ begin
   FNormalisers.Add(N);
 end;
 
+procedure TKANAttentionLayerInfo.RecordSweepClipRate(
+  const SweepClipRate: TNeuralFloat);
+begin
+  // EMA update: FClipRateEMA <- (1 - λ) · FClipRateEMA + λ · SweepClipRate.
+  FClipRateEMA := (1 - FClipRateEmaLambda) * FClipRateEMA
+                  + FClipRateEmaLambda * SweepClipRate;
+
+  // Sustained-pressure counter: increment if the EMA is above the threshold,
+  // otherwise reset to zero. The reset on a single low sweep is intentional —
+  // K_squaring (default 64) is what gives the sustained-pressure semantics.
+  if FClipRateEMA > FTauSquaring then
+    Inc(FConsecutiveHighSweeps)
+  else
+    FConsecutiveHighSweeps := 0;
+end;
+
+function TKANAttentionLayerInfo.ShouldFireSquaring: boolean;
+begin
+  Result := (FActiveHeads < FHMax)
+            and (FConsecutiveHighSweeps >= FKSquaring);
+end;
+
 procedure TKANAttentionLayerInfo.CheckSquaring;
 begin
-  // TODO: aggregate per-head clip activity into FClipRateEMA;
-  // if FClipRateEMA > τ_squaring for K_squaring consecutive sweeps,
-  // fire squaring (spec §5.4.4).
-  raise EKANBadState.Create('TKANAttentionLayerInfo.CheckSquaring: not implemented');
+  if ShouldFireSquaring then
+  begin
+    // TODO: actual squaring operation per spec §5.4.4 — log-normal
+    // perturbation of newly-active heads using FRNG. For now this is
+    // a stub; the trigger detection itself is real and tested.
+    raise EKANBadState.Create(
+      'TKANAttentionLayerInfo.CheckSquaring: trigger fired but DoSquaring not implemented');
+    // FConsecutiveHighSweeps := 0;   // would reset after firing
+  end;
 end;
 
 // =====================================================================

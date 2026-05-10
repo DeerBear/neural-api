@@ -48,10 +48,11 @@ type
     destructor Destroy; override;
 
     /// Evaluates the k+1 non-zero basis values at score s.
-    /// Writes to Vals[0..k]; returns the index of the first active basis.
+    /// Writes to Vals[0..k]; returns the index of the first active basis
+    /// in FirstIdx. Caller must pass an open array of length >= k+1.
     procedure Evaluate(const s: TNeuralFloat;
                        out FirstIdx: integer;
-                       Vals: PSingle);
+                       out Vals: array of TNeuralFloat);
 
     /// NLMS denominator term: Σ_j B_j(s)² over the k+1 active basis functions.
     function BasisSquaredSum(const s: TNeuralFloat): TNeuralFloat;
@@ -125,12 +126,15 @@ end;
 
 procedure TKANBasis.Evaluate(const s: TNeuralFloat;
                               out FirstIdx: integer;
-                              Vals: PSingle);
+                              out Vals: array of TNeuralFloat);
 var
   h, t, absT, v: TNeuralFloat;
   i, idx: integer;
-  ValsArr: PSingleArray absolute Vals;
 begin
+  if Length(Vals) < 4 then
+    raise EKANBadState.CreateFmt(
+      'TKANBasis.Evaluate: Vals length %d < required 4 (k+1)', [Length(Vals)]);
+
   h := (FGridSpec.GridHigh - FGridSpec.GridLow) / (FGridSpec.KnotCount - 1);
   // The 4 active basis functions are those centred at knot indices
   // floor((s - GridLow)/h) - 1, ..., +2.
@@ -141,7 +145,7 @@ begin
     idx := FirstIdx + i;
     if (idx < 0) or (idx >= FGridSpec.KnotCount) then
     begin
-      ValsArr^[i] := 0;
+      Vals[i] := 0;
       continue;
     end;
     t := (s - FKnots[idx]) / h;
@@ -152,7 +156,7 @@ begin
       v := (1.0 / 6.0) * Power(2 - absT, 3)
     else
       v := 0;
-    ValsArr^[i] := v;
+    Vals[i] := v;
   end;
 end;
 
@@ -161,7 +165,7 @@ var
   Vals: array[0..3] of TNeuralFloat;
   FirstIdx, i: integer;
 begin
-  Evaluate(s, FirstIdx, @Vals[0]);
+  Evaluate(s, FirstIdx, Vals);
   Result := 0;
   for i := 0 to 3 do Result := Result + Vals[i] * Vals[i];
 end;
