@@ -54,6 +54,12 @@ type
     procedure TestKANInferenceForwardRequiresLock;
     procedure TestKANSeededRNGDeterministic;
     procedure TestKANSeededRNGRoundTripsThroughSerialisation;
+
+    // ---- B-spline basis (impl doc §3.4) ----
+    procedure TestKANBasisLocalSupport;
+    procedure TestKANBasisPositivity;
+    procedure TestKANBasisInteriorPartitionOfUnity;
+    procedure TestKANBasisFitToExpReasonable;
   end;
 
 implementation
@@ -234,6 +240,137 @@ begin
   R2.State := Snapshot;
   for i := 0 to 1000 do
     AssertEquals('RNG state restore reproduces sequence', R1.NextU64, R2.NextU64);
+end;
+
+// ---- B-spline basis ----
+
+function MakeDefaultGridSpec(KnotCount: integer = 64): TKANGridSpec;
+begin
+  Result.GridLow := -8.0;
+  Result.GridHigh := 8.0;
+  Result.KnotCount := KnotCount;
+  Result.BasisOrder := 3;
+end;
+
+procedure TTestNeuralKAN.TestKANBasisLocalSupport;
+var
+  Basis: TKANBasis;
+  Spec: TKANGridSpec;
+  Vals: array[0..3] of TNeuralFloat;
+  FirstIdx, i, NonZeroCount: integer;
+  s: TNeuralFloat;
+begin
+  Spec := MakeDefaultGridSpec(32);
+  Basis := TKANBasis.Create(Spec);
+  try
+    // Pick an interior score (well away from boundaries).
+    s := 0.5;
+    Basis.Evaluate(s, FirstIdx, @Vals[0]);
+    NonZeroCount := 0;
+    for i := 0 to 3 do
+      if Vals[i] > 0 then Inc(NonZeroCount);
+    AssertTrue('Interior score must have at least 3 non-zero basis values',
+               NonZeroCount >= 3);
+    AssertTrue('Interior score must have at most k+1 = 4 non-zero basis values',
+               NonZeroCount <= 4);
+  finally
+    Basis.Free;
+  end;
+end;
+
+procedure TTestNeuralKAN.TestKANBasisPositivity;
+var
+  Basis: TKANBasis;
+  Spec: TKANGridSpec;
+  Vals: array[0..3] of TNeuralFloat;
+  FirstIdx, i, j: integer;
+  s: TNeuralFloat;
+begin
+  Spec := MakeDefaultGridSpec(32);
+  Basis := TKANBasis.Create(Spec);
+  try
+    // Sample 50 scores across the grid range.
+    for i := 0 to 49 do
+    begin
+      s := -7.5 + i * (15.0 / 49);
+      Basis.Evaluate(s, FirstIdx, @Vals[0]);
+      for j := 0 to 3 do
+        AssertTrue(Format('Basis value at s=%.3f index %d must be >= 0 (got %.6f)',
+                          [s, j, Vals[j]]),
+                   Vals[j] >= 0);
+    end;
+  finally
+    Basis.Free;
+  end;
+end;
+
+procedure TTestNeuralKAN.TestKANBasisInteriorPartitionOfUnity;
+var
+  Basis: TKANBasis;
+  Spec: TKANGridSpec;
+  Vals: array[0..3] of TNeuralFloat;
+  FirstIdx, i, j: integer;
+  s, total: TNeuralFloat;
+begin
+  Spec := MakeDefaultGridSpec(64);
+  Basis := TKANBasis.Create(Spec);
+  try
+    // Cardinal cubic B-splines on a uniform grid sum to 1 in the
+    // interior (away from boundaries). Sample 20 points well inside.
+    for i := 0 to 19 do
+    begin
+      s := -6.0 + i * (12.0 / 19);
+      Basis.Evaluate(s, FirstIdx, @Vals[0]);
+      total := 0;
+      for j := 0 to 3 do total := total + Vals[j];
+      AssertTrue(Format('Interior partition-of-unity at s=%.3f: sum=%.6f, expected ~1.0',
+                        [s, total]),
+                 Abs(total - 1.0) < 1e-4);
+    end;
+  finally
+    Basis.Free;
+  end;
+end;
+
+procedure TTestNeuralKAN.TestKANBasisFitToExpReasonable;
+var
+  Basis: TKANBasis;
+  Spec: TKANGridSpec;
+  Coeffs: array of TNeuralFloat;
+  Vals: array[0..3] of TNeuralFloat;
+  FirstIdx, i, j, idx: integer;
+  s, psi, phi, expected, relErr: TNeuralFloat;
+begin
+  Spec := MakeDefaultGridSpec(64);
+  Basis := TKANBasis.Create(Spec);
+  try
+    SetLength(Coeffs, Spec.KnotCount);
+    Basis.FitPsiToExp(Coeffs);
+
+    // After fit: phi = psi^2 should be ~ exp(s) at interior knot midpoints.
+    // Allow generous tolerance — collocation-based init is approximate
+    // (not a full least-squares fit).
+    for i := 1 to 60 do
+    begin
+      s := -6.0 + i * (12.0 / 60);
+      Basis.Evaluate(s, FirstIdx, @Vals[0]);
+      psi := 0;
+      for j := 0 to 3 do
+      begin
+        idx := FirstIdx + j;
+        if (idx >= 0) and (idx < Spec.KnotCount) then
+          psi := psi + Coeffs[idx] * Vals[j];
+      end;
+      phi := psi * psi;
+      expected := Exp(s);
+      relErr := Abs(phi - expected) / expected;
+      AssertTrue(Format('FitPsiToExp at s=%.3f: phi=%.6g, expected exp(s)=%.6g, relErr=%.4f',
+                        [s, phi, expected, relErr]),
+                 relErr < 0.05);    // 5% tolerance for v1 collocation init
+    end;
+  finally
+    Basis.Free;
+  end;
 end;
 
 initialization
