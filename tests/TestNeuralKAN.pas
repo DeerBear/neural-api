@@ -18,7 +18,8 @@ interface
 
 uses
   Classes, SysUtils, Math, fpcunit, testregistry,
-  neuralvolume, neuralnetwork, neuralkanattention;
+  neuralvolume, neuralnetwork,
+  neuralkantypes, neuralkanbasis, neuralkannormaliser, neuralkanattention;
 
 type
   TTestNeuralKAN = class(TTestCase)
