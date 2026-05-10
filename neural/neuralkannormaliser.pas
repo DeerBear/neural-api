@@ -41,19 +41,34 @@ type
   /// Per-head B-spline normaliser. Drop-in replacement for the per-head
   /// TNNetPointwiseSoftMax inside multi-head self-attention.
   ///
-  /// Architecture: this is a **decorator** of TNNetPointwiseSoftMax, not
-  /// a subclass. It inherits TNNetIdentity (matching the impl-doc §5.1
-  /// "drop-in replacement, not extension" framing) and holds an internal
-  /// TNNetPointwiseSoftMax instance to which it delegates in fallback
-  /// mode. Concrete behaviour:
+  /// Architecture: a **chain-level decorator** of TNNetPointwiseSoftMax.
+  /// The KAN normaliser is constructed downstream of a real
+  /// TNNetPointwiseSoftMax chain layer. The chain shape produced by
+  /// TKANNet.AddKANSelfAttention is:
   ///
-  ///   - In training mode (FInferenceMode = false), or when KAN is
-  ///     disabled (FKANEnabled = false), Compute and Backpropagate
-  ///     delegate to the decorated softmax instance — bit-identical
-  ///     to TNNetPointwiseSoftMax with no risk of behavioural drift.
-  ///   - In inference mode with KANEnabled = true, Compute runs the
-  ///     §7 KAN pipeline. Backpropagate raises EKANInInference (the
-  ///     spec forbids backprop while KAN is active; §5.5.1).
+  ///     scores -> [TNNetPointwiseSoftMax] -> [TNNetKANNormaliser] -> ...
+  ///                  (real chain layer)        (this class)
+  ///
+  /// Behaviour:
+  ///   - Fallback mode (FInferenceMode = false, or FKANEnabled = false):
+  ///     pure identity passthrough. Compute = inherited TNNetIdentity
+  ///     copy from FPrevLayer.FOutput (the softmax output) to FOutput.
+  ///     Backpropagate = inherited TNNetIdentity propagation back to
+  ///     FPrevLayer (the softmax), which then does softmax-derivative
+  ///     backprop via its own Backpropagate. Bit-identical to the
+  ///     original AddSelfAttention chain by construction — we are
+  ///     literally invisible.
+  ///
+  ///   - KAN mode (both flags true): Compute reads pre-softmax scores
+  ///     from FPrevLayer.FPrevLayer.FOutput (the chain layer immediately
+  ///     before the softmax) and runs the §7 pipeline. The softmax's
+  ///     output (FPrevLayer.FOutput) is still available for the KL
+  ///     comparison required by §6.1, no extra computation needed.
+  ///     Backpropagate raises EKANInInference (spec §5.5.1).
+  ///
+  /// The framework manages the chain softmax's counters, output sizing,
+  /// and backprop entirely on its own — the KAN normaliser does not
+  /// hold any softmax instance or fudge any counters.
   TNNetKANNormaliser = class(TNNetIdentity)
   private
     // --- Identity ---
@@ -63,14 +78,6 @@ type
     // --- Shared resources (owned by TKANAttentionLayerInfo) ---
     FBasis: TKANBasis;
     FRNG: PKANSeededRNG;
-
-    // --- Decorated softmax instance ---
-    // We hold a literal TNNetPointwiseSoftMax instance and delegate to it
-    // in fallback mode. This is a pure decorator: the softmax is
-    // configured with our FPrevLayer (so it reads the same input we read)
-    // and its FOutput is copied into ours after delegation. The softmax
-    // is owned by us; it is NOT part of any TNNet's layer chain.
-    FInternalSoftmax: TNNetPointwiseSoftMax;
 
     // --- Per-head mutable state ---
     FHead: TKANHeadState;
@@ -115,9 +122,6 @@ type
     procedure ColdStartHead;
     procedure ZeroOutputForInactive;
 
-    // --- Soft-mode forward (used when InferenceMode=false or KANEnabled=false) ---
-    procedure ComputeAsSoftmax;
-
   public
     constructor Create(const GridSpec: TKANGridSpec;
                        const AttentionLayerId, HeadIndex: integer;
@@ -127,7 +131,6 @@ type
 
     procedure Compute; override;
     procedure Backpropagate; override;
-    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
 
     function  SaveDataToString: string; override;
     procedure LoadDataFromString(strData: string); override;
@@ -162,17 +165,10 @@ constructor TNNetKANNormaliser.Create(const GridSpec: TKANGridSpec;
                                        const SharedBasis: TKANBasis;
                                        const SharedRNG: PKANSeededRNG);
 begin
+  // No internal softmax instance — this layer is a chain-level
+  // decorator of the TNNetPointwiseSoftMax that TKANNet.AddKANSelfAttention
+  // places immediately upstream. See class doc-comment.
   inherited Create;
-
-  // Decorated softmax: a literal TNNetPointwiseSoftMax instance we
-  // delegate to in fallback mode. SkipBackpropDerivative=0, NoForward=0
-  // are the default behaviours used by AddSelfAttention.
-  FInternalSoftmax := TNNetPointwiseSoftMax.Create(0, 0);
-  // The decorated softmax is held privately; it is not part of any
-  // network's chain. Set its FDepartingBranchesCnt := 1 so that when
-  // we delegate to its Backpropagate, the framework's branch-barrier
-  // assertion (TestBackPropCallCurrCnt) sees a self-consistent state.
-  FInternalSoftmax.FDepartingBranchesCnt := 1;
 
   FAttentionLayerId := AttentionLayerId;
   FHeadIndex := HeadIndex;
@@ -212,8 +208,6 @@ end;
 
 destructor TNNetKANNormaliser.Destroy;
 begin
-  // FInternalSoftmax is owned by us — free it before the parent runs.
-  FreeAndNil(FInternalSoftmax);
   SetLength(FHead.Coeffs, 0);
   SetLength(FPhiRow, 0);
   SetLength(FWSoftmaxRow, 0);
@@ -224,30 +218,31 @@ begin
   inherited Destroy;
 end;
 
-procedure TNNetKANNormaliser.SetPrevLayer(pPrevLayer: TNNetLayer);
-begin
-  inherited SetPrevLayer(pPrevLayer);
-  // Wire the decorated softmax to the same input we read. Its FOutput
-  // and FOutputError get sized by its own SetPrevLayer's resize chain
-  // to match the input — exactly what TNNetPointwiseSoftMax does when
-  // it's added to a network normally.
-  FInternalSoftmax.SetPrevLayer(pPrevLayer);
-end;
-
 procedure TNNetKANNormaliser.Compute;
 begin
   if (not FInferenceMode) or (not FKANEnabled) then
   begin
-    ComputeAsSoftmax;
+    // Fallback: pure identity passthrough. FPrevLayer is the softmax
+    // (placed by AddKANSelfAttention), FPrevLayer.FOutput already holds
+    // the row-normalised attention weights. inherited Compute (from
+    // TNNetIdentity) copies that into FOutput. No KAN bookkeeping, no
+    // per-head state mutation, no extra cost.
+    inherited Compute;
     exit;
   end;
 
+  // KAN mode: read pre-softmax scores from FPrevLayer.FPrevLayer.FOutput
+  // (the chain layer immediately before the softmax) and run §7
+  // pipeline. The softmax's output (FPrevLayer.FOutput) is available
+  // for the KL comparison (spec §6.1) at no extra forward cost.
+  //
   // TODO: §7 pipeline.
-  //   for each row in input:
-  //     EvaluateSplineRow
-  //     ComputeWeightsRow
+  //   for each row in pre-softmax scores:
+  //     EvaluateSplineRow      (write FPhiRow, FRowSum from coefficients)
+  //     ComputeWeightsRow      (FWKANRow := φ / Σ φ;
+  //                             FWSoftmaxRow := already in FPrevLayer.FOutput)
   //     write selected weights to FOutput
-  //     update KL EMA
+  //     ComputeKLRow           (uses FPrevLayer.FOutput directly)
   //     NLMS (Phase M or Phase D depending on Status)
   //     Mechanism1Sweep
   //     GaugeRenormalise
@@ -262,42 +257,12 @@ begin
     raise EKANInInference.Create(
       'Backpropagate called on KAN normaliser layer in inference mode');
 
-  // Standard branch-tracking for our own counter (the framework expects
-  // every layer's Backpropagate to manage these counters).
-  Inc(FBackPropCallCurrentCnt);
-  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  TestBackPropCallCurrCnt;
-
-  // Delegate to the decorated softmax. It performs:
-  //   - the softmax derivative computation (x*(1-x))
-  //   - accumulation into FPrevLayer.OutputError
-  //   - cascade via FPrevLayer.Backpropagate
-  // The framework does not reset FInternalSoftmax's counter (since the
-  // softmax is held privately, not registered in any chain), so we
-  // reset it ourselves before each delegation.
-  FInternalSoftmax.FBackPropCallCurrentCnt := 0;
-  FInternalSoftmax.FOutputError.CopyNoChecks(FOutputError);
-  FInternalSoftmax.Backpropagate;
-
-  // We do NOT call inherited Backpropagate here — that would also
-  // accumulate FOutputError into FPrevLayer.OutputError, double-counting
-  // the gradient.
-end;
-
-procedure TNNetKANNormaliser.ComputeAsSoftmax;
-begin
-  // Pure decorator: delegate to the held softmax instance.
-  //   1. The softmax reads FPrevLayer.FOutput (same as ours, wired in
-  //      SetPrevLayer) and writes to FInternalSoftmax.FOutput.
-  //   2. We copy that into our own FOutput so downstream layers see it.
-  //
-  // Used:
-  //   - during training (FInferenceMode = false), so the layer behaves
-  //     identically to the original softmax it replaces;
-  //   - when this layer's KANEnabled is false (selective-deployment
-  //     opt-out, spec §11.8 / impl doc §4.6).
-  FInternalSoftmax.Compute;
-  FOutput.CopyNoChecks(FInternalSoftmax.FOutput);
+  // Fallback: pure identity passthrough. inherited Backpropagate (from
+  // TNNetIdentity) accumulates FOutputError into FPrevLayer.FOutputError
+  // (the softmax's), then cascades via FPrevLayer.Backpropagate which is
+  // the softmax's full softmax-derivative backprop. No counter fudging
+  // and no decorator-specific code path needed; the framework does it all.
+  inherited Backpropagate;
 end;
 
 function TNNetKANNormaliser.SaveDataToString: string;
