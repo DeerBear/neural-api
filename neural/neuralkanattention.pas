@@ -75,7 +75,8 @@ type
                        const Seed: UInt64;
                        const TauSquaring: TNeuralFloat = 0.10;
                        const KSquaring: integer = 64;
-                       const ClipRateEmaLambda: TNeuralFloat = 0.01);
+                       const ClipRateEmaLambda: TNeuralFloat = 0.01;
+                       const InitialActiveHeads: integer = 2);
     destructor Destroy; override;
 
     procedure RegisterNormaliser(const N: TNNetKANNormaliser);
@@ -186,7 +187,8 @@ constructor TKANAttentionLayerInfo.Create(const AttentionLayerId: integer;
                                            const Seed: UInt64;
                                            const TauSquaring: TNeuralFloat;
                                            const KSquaring: integer;
-                                           const ClipRateEmaLambda: TNeuralFloat);
+                                           const ClipRateEmaLambda: TNeuralFloat;
+                                           const InitialActiveHeads: integer);
 begin
   inherited Create;
 
@@ -203,13 +205,17 @@ begin
     raise EKANBadState.CreateFmt(
       'TKANAttentionLayerInfo.Create: ClipRateEmaLambda must be in (0,1], got %g',
       [ClipRateEmaLambda]);
+  if (InitialActiveHeads < 2) or (InitialActiveHeads > HMax) then
+    raise EKANBadState.CreateFmt(
+      'TKANAttentionLayerInfo.Create: InitialActiveHeads %d must be in [2, HMax=%d]',
+      [InitialActiveHeads, HMax]);
 
   FAttentionLayerId := AttentionLayerId;
   FBasis := TKANBasis.Create(Spec);
   FRNG.Seed(Seed);
 
   FHMax := HMax;
-  FActiveHeads := 2;                    // spec-mandated initial value (§5.4.2)
+  FActiveHeads := InitialActiveHeads;   // spec §5.4.2 default is 2; growth via squaring.
 
   FClipRateEMA := 0;
   FClipRateEmaLambda := ClipRateEmaLambda;
@@ -322,22 +328,123 @@ function TKANNet.AddKANSelfAttention(
   const SquaringClipRate: TNeuralFloat;
   const SquaringSweeps: integer
 ): TNNetLayer;
+var
+  PreviousLayer: TNNetLayer;
+  PreviousDepth, PreviousSizeX, PreviousSizeY, InputChannelsPerGroup: integer;
+  HMax, HeadCnt, AttentionLayerId: integer;
+  Spec: TKANGridSpec;
+  Info: TKANAttentionLayerInfo;
+  Normaliser: TNNetKANNormaliser;
+  Seed: UInt64;
+  QueryGroup, KeyGroup, ValueGroup: TNNetLayer;
+  LocalQueryGroup, LocalKeyGroup, LocalValueGroup, LocalValueTGroup: TNNetLayer;
+  NormaliserLayer: TNNetLayer;
+  EachGroupOutput: array of TNNetLayer;
+
+  function LargestPow2AtMost(const n: integer): integer;
+  begin
+    Result := 1;
+    while (Result * 2) <= n do Result := Result * 2;
+  end;
+
 begin
   AssertNotLocked('AddKANSelfAttention');
 
-  // TODO:
-  //   1. Compute H_max := largest_pow2 <= ⌊d/2⌋ if HeadCeiling = 0
-  //   2. Build TKANGridSpec; create TKANAttentionLayerInfo with seeded RNG
-  //   3. Mirror AddSelfAttention's chain construction:
-  //        Q, K, V projections -> scale -> split into H_max heads
-  //   4. For each of H_max heads: insert TNNetKANNormaliser (instead of softmax)
-  //   5. Concat H_max heads (DeepConcat); inactive heads contribute zero via mask
-  //   6. Apply output projection W_O
-  //   7. Register normalisers in TKANAttentionLayerInfo
-  //   8. Return final layer
+  PreviousLayer := GetLastLayer();
+  PreviousDepth := PreviousLayer.Output.Depth;
+  PreviousSizeX := PreviousLayer.Output.SizeX;
+  PreviousSizeY := PreviousLayer.Output.SizeY;
+  if PreviousSizeY > 1 then
+    PreviousLayer := AddLayer(TNNetReshape.Create(
+      PreviousSizeX * PreviousSizeY, 1, PreviousDepth));
 
-  Result := nil;
-  raise EKANBadState.Create('TKANNet.AddKANSelfAttention: not implemented');
+  // (1) Resolve H_max. Spec §5.4.2: default is the largest power of two
+  // not exceeding floor(d/2). Caller can override with an explicit ceiling.
+  if HeadCeiling = 0 then
+    HMax := LargestPow2AtMost(PreviousDepth div 2)
+  else
+    HMax := HeadCeiling;
+  if HMax < 2 then HMax := 2;
+  if (PreviousDepth mod HMax) <> 0 then
+    raise EKANBadState.CreateFmt(
+      'AddKANSelfAttention: PreviousDepth %d not divisible by HMax %d',
+      [PreviousDepth, HMax]);
+  if (InitialHeads < 2) or (InitialHeads > HMax) then
+    raise EKANBadState.CreateFmt(
+      'AddKANSelfAttention: InitialHeads %d must be in [2, HMax=%d]',
+      [InitialHeads, HMax]);
+
+  // (2) Build grid spec and per-layer info. Seed combines a per-network
+  // counter with the grid hash so two layers with the same spec still get
+  // distinct deterministic streams (spec §9).
+  Spec.GridLow := GridLow;
+  Spec.GridHigh := GridHigh;
+  Spec.KnotCount := GridKnots;
+  Spec.BasisOrder := BasisOrder;
+  AttentionLayerId := FNextAttentionLayerId;
+  Inc(FNextAttentionLayerId);
+  Seed := (UInt64(AttentionLayerId + 1) * UInt64($9E3779B97F4A7C15)) xor Spec.Hash;
+  if Seed = 0 then Seed := 1;
+
+  Info := TKANAttentionLayerInfo.Create(AttentionLayerId, Spec, HMax, Seed,
+    SquaringClipRate, SquaringSweeps, 0.01, InitialHeads);
+  FAttentionLayers.Add(Info);
+
+  // SharpenAlpha / KLThreshold / KLConfirmPasses are not yet propagated to
+  // each TNNetKANNormaliser instance — the normaliser still uses its own
+  // defaults from its constructor. Wiring these through requires adding
+  // published-property setters on the normaliser; out of scope for v1.
+
+  // (3) Q/K/V projections — mirror AddSelfAttention's no-HasNorm branch.
+  QueryGroup := AddLayerAfter([TNNetPointwiseConvLinear.Create(PreviousDepth, 1)], PreviousLayer);
+  KeyGroup   := AddLayerAfter([TNNetPointwiseConvLinear.Create(PreviousDepth, 1)], PreviousLayer);
+  ValueGroup := AddLayerAfter([TNNetPointwiseConvLinear.Create(PreviousDepth, 1)], PreviousLayer);
+  QueryGroup := AddLayerAfter([TNNetSignedSquareRoot1.Create()], QueryGroup);
+  KeyGroup   := AddLayerAfter([TNNetSignedSquareRoot1.Create()], KeyGroup);
+  ValueGroup := AddLayerAfter([TNNetSignedSquareRoot1.Create()], ValueGroup);
+
+  // (4) Per-head sub-path. The TNNetKANNormaliser sits immediately downstream
+  // of the per-head TNNetPointwiseSoftMax as a chain-level decorator. While
+  // the network is unlocked (or KAN is disabled), the decorator is a pure
+  // identity passthrough, so the forward+backward path is bit-identical to
+  // AddSelfAttention — this is what gives IT-Retrofit.
+  SetLength(EachGroupOutput, HMax);
+  InputChannelsPerGroup := PreviousDepth div HMax;
+  for HeadCnt := 0 to HMax - 1 do
+  begin
+    LocalQueryGroup := AddLayerAfter([
+      TNNetSplitChannels.Create(HeadCnt * InputChannelsPerGroup, InputChannelsPerGroup)],
+      QueryGroup);
+    LocalKeyGroup := AddLayerAfter([
+      TNNetSplitChannels.Create(HeadCnt * InputChannelsPerGroup, InputChannelsPerGroup)],
+      KeyGroup);
+    LocalValueGroup := AddLayerAfter([
+      TNNetSplitChannels.Create(HeadCnt * InputChannelsPerGroup, InputChannelsPerGroup)],
+      ValueGroup);
+    LocalValueTGroup := AddLayerAfter(TNNetTransposeXD.Create(), LocalValueGroup);
+
+    AddLayer(TNNetDotProducts.Create(LocalQueryGroup, LocalKeyGroup, {NoForward=}false));
+    AddLayer(TNNetMulByConstant.Create(1 / Sqrt(InputChannelsPerGroup)));
+    AddLayer(TNNetReLUL.Create(-500, +500, 0));
+    AddLayer(TNNetPointwiseSoftMax.Create(0, 0));
+
+    Normaliser := TNNetKANNormaliser.Create(Spec, AttentionLayerId, HeadCnt,
+                                            Info.Basis, @Info.FRNG);
+    NormaliserLayer := AddLayer(Normaliser);
+    Info.RegisterNormaliser(Normaliser);
+
+    AddLayer(TNNetDotProducts.Create(LocalValueTGroup, NormaliserLayer));
+    EachGroupOutput[HeadCnt] := GetLastLayer();
+  end;
+
+  // (5) Concatenate heads and apply the output projection W_O.
+  AddLayer(TNNetDeepConcat.Create(EachGroupOutput));
+  SetLength(EachGroupOutput, 0);
+  Result := AddLayer([TNNetPointwiseConvLinear.Create(PreviousDepth, 1)]);
+  Result := AddLayer([TNNetSignedSquareRoot1.Create()]);
+
+  if PreviousSizeY > 1 then
+    Result := AddLayer(TNNetReshape.Create(PreviousSizeX, PreviousSizeY, PreviousDepth));
 end;
 
 procedure TKANNet.LockToInference;
