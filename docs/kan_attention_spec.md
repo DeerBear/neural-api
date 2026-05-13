@@ -150,7 +150,7 @@ The KAN attention normaliser is composed of five interacting components. Each is
 
 **Initialisation.**
 
-- At layer construction (or first retrofit load), coefficients are fitted such that `φ(s) ≈ exp(s)` over the grid range. A simple least-squares fit on a dense grid of `(s, exp(s))` pairs suffices.
+- At layer construction (or first retrofit load), coefficients are fitted such that `φ(s) ≈ exp(s)` over the grid range. Because the non-negativity constraint is satisfied via the `φ = ψ²` parametrisation (see Constraints above), the fit is performed **in ψ-space**: `ψ(s) ≈ exp(s/2)`, so that `φ = ψ² ≈ exp(s)`. A simple least-squares fit on a dense grid of `(s, exp(s/2))` pairs suffices. The stored coefficients `c_j` are ψ's, not φ's.
 - Phase M therefore starts with the KAN already approximating softmax. `KL_ema` begins near zero rather than at random, dramatically shortening Phase M for retrofit deployments.
 
 **Grid configuration.**
@@ -280,7 +280,9 @@ for iter in 1 .. max_iter:
     if fired == 0: break       -- fixed point reached
 ```
 
-The cascade is guaranteed to reduce total per-window deviation from the GM in the long-run average (the share rule choice in Mode C makes each step variance-reducing). The hard cap `max_iter = 16` is a safety guard against pathological inputs; in practice the cascade typically converges in 1–3 iterations.
+**Convergence.** Empirically the cascade terminates in 1–3 iterations under default parameters and Mode C share rules; formal convergence is **not proven in v1** and is not relied upon by any other part of the spec. The hard cap `max_iter = 16` is a safety guard against pathological inputs.
+
+**Behaviour at the cap.** If the cascade hits `max_iter` without `fired == 0`, the sweep terminates with the current state and the per-layer counter `cascade_cap_hits` (§8.1) is incremented. The partially-converged state still satisfies invariant **M1-1** (every individual high-clip and low-lift step preserves window products by construction), so energy conservation is intact. Only invariant **M1-3** (bounded coefficients) may be violated for that pass; the next pass's sweep will continue the relaxation. Sustained nonzero `cascade_cap_hits` across many sweeps is a misconfiguration signal (e.g. score range mismatched to grid, pathological input); it does not by itself break the spec's safety floor.
 
 #### 5.2.7 Counters Updated
 
@@ -345,7 +347,7 @@ And the row-normalised attention weight:
 w_new = φ_new(s) / Σ φ_new = (φ_old(s)/G) / (Σ φ_old/G) = φ_old(s) / Σ φ_old = w_old
 ```
 
-The attention output is **bit-identical** before and after renormalisation (up to floating-point reordering of operations). The renormalisation is a pure gauge transformation.
+The renormalisation is a pure gauge transformation: the attention output is **mathematically equal** before and after, with the only difference being the floating-point rounding introduced by the per-coefficient rescale `c_j ← c_j / G`. The resulting per-weight error is bounded by `O(N · ε_machine)`, well below `ε_KL` and below any threshold the rest of the spec relies on.
 
 #### 5.3.5 Composition with Mechanism #1
 
@@ -373,7 +375,7 @@ After step 3, the head is in a canonical state: GM=1 and all window products con
 After step 7 of the per-inference pipeline (§7), on every head:
 
 - **(GM-1)** `|G − 1| < ε_gauge` where `ε_gauge` is at machine-precision tolerance for the head's coefficient count.
-- **(GM-2)** The forward attention weights computed before and after renormalisation are bit-identical (up to FP reordering).
+- **(GM-2)** The forward attention weights computed before and after renormalisation are mathematically equal; the per-weight FP error from the rescale is bounded by `O(N · ε_machine)`.
 - **(GM-3)** Every coefficient sign is preserved.
 
 ### 5.4 Multi-Head Dynamics — Head Squaring
@@ -393,9 +395,14 @@ If the data calls for an attention pattern that cannot fit within one head's bud
 At layer construction:
 
 ```
-H_max := ⌊ embedding_dim / 2 ⌋    -- architectural ceiling: minimum 2 channels per head
+H_max := largest_power_of_2_leq( ⌊ embedding_dim / 2 ⌋ )
+                                  -- architectural ceiling: ≥ 2 channels per head,
+                                  -- and a power of 2 so the squaring progression
+                                  -- 2 → 4 → 16 → 256 → … fits cleanly
 ActiveHeads := 2                  -- specification-mandated initial value
 ```
+
+For typical `embedding_dim ∈ {128, 256, 512, 768, 1024, ...}` the rounding-down to a power of 2 changes `H_max` by at most a factor of 2 and is almost always the identity. The restriction is essential for invariant **HS-2** (power-of-2 progression) to hold without exceptions: every squaring event must satisfy `spawn_per_parent = H_new / H_old ∈ ℕ`, which requires `H_max` to itself be a power of 2.
 
 All `H_max` heads are **physically allocated** at construction time (coefficients, RNG state, counters). Heads with index `≥ ActiveHeads` are **inactive**:
 
@@ -436,7 +443,11 @@ for parent_idx in 0 .. H_old - 1:
         copy parent's B-spline coefficients into child slot
         for each c_j in child's coefficients:
             c_j ← c_j · exp( N(0, σ²) )    -- log-normal perturbation, seeded RNG
-        copy parent's clip counters / KL EMA into child as starting state
+        -- inherit full per-head bookkeeping from parent:
+        status[child_idx]                 := status[parent_idx]
+        KL_ema[child_idx]                 := KL_ema[parent_idx]
+        consecutive_low_passes[child_idx] := consecutive_low_passes[parent_idx]
+        clip_count_total[child_idx]       := clip_count_total[parent_idx]
 
 ActiveHeads := H_new
 ```
@@ -446,6 +457,7 @@ Properties:
 - Each existing head retains its slot and its coefficients unchanged.
 - `H_new − H_old` new heads are populated as perturbed clones of the existing heads.
 - The perturbation is **multiplicative log-normal** with `σ ≈ 0.01`. Multiplicative is consistent with the GM=1 gauge: it preserves expected `log |c_j|` (so the new head also satisfies GM=1 to first order) and breaks symmetry without large jumps.
+- **Children inherit the parent's `status`.** A child of a `KANActive` parent starts in `KANActive` (the small log-normal perturbation keeps it within the parent's converged basin; restarting in Phase M would be incoherent because the spline shape is no longer a softmax mimic). A child of a `SoftmaxActive` parent starts in `SoftmaxActive` and inherits the parent's `KL_ema` and `consecutive_low_passes`, so it can reach handover quickly if its own converged dynamics permit.
 - The RNG used is the **per-layer seeded RNG**, so the operation is deterministic given the saved state (§9).
 - Because GM=1 is approximately preserved by the perturbation, the new heads' coefficients land in the same canonical range; no re-gauge is needed at squaring time (the next per-inference step's gauge fixing will tidy any first-order drift).
 
@@ -506,9 +518,10 @@ This is information not available from any standard transformer at any inspectio
 After every per-inference pipeline step (§7), per layer:
 
 - **(HS-1)** `ActiveHeads ∈ ℕ`, `2 ≤ ActiveHeads ≤ H_max`, monotonic non-decreasing across the run.
-- **(HS-2)** `ActiveHeads` is a power of 2 (consequence of repeated squaring from the initial value 2). After clamping at `H_max`, this may not hold if `H_max` is not a power of 2; in that case `ActiveHeads ∈ {2, 4, 16, 256, …, H_max}`.
+- **(HS-2)** `ActiveHeads` is a power of 2 at all times. The progression `2 → 4 → 16 → 256 → …` is preserved by the spec's requirement that `H_max` is itself a power of 2 (§5.4.2).
 - **(HS-3)** Inactive heads (index `≥ ActiveHeads`) contribute zero to the layer's forward output.
 - **(HS-4)** Squaring transitions are deterministic given the per-layer RNG state.
+- **(HS-6)** A child head spawned at squaring inherits its parent's `status`, `KL_ema`, `consecutive_low_passes`, and `clip_count_total` as starting state; only the spline coefficients are perturbed.
 
 ### 5.5 Autonomous Local Learning
 
@@ -544,20 +557,29 @@ for each j with B_j(s) ≠ 0:                                -- only k+1 coeffic
 
 #### 5.5.3 Phase D Rule — Self-Distillation Sharpening
 
-For each attention score `s` evaluated in a forward pass, while the head's `status = KANActive`:
+The Phase D rule is **row-coupled**: it depends on the full row's pre-normalisation spline outputs, not just the per-score `(s, φ(s))` pair. To keep the rule deterministic and order-independent within a row, the row sum is **snapshotted once at the start of the row** and reused for every per-score update inside that row. Per-score updates within a row do not see each other's perturbations of the spline; the next row recomputes the snapshot from the now-updated coefficients.
+
+For the row containing scores `s_i_·`, while the head's `status = KANActive`:
 
 ```
-w        := φ(s_i_·) / Σ_j φ(s_i_j)        -- current attention weights for the row containing s
-w_sharp  := w^α / Σ(w^α)                    -- power-α renormalisation, α slightly > 1
-target_s := w_sharp[position(s)] · Σ φ(s_i_·)    -- back into pre-normalisation space
-err      := target_s − φ(s)
+-- snapshot once per row, before any per-score updates --
+phi_row[j]      := φ(s_i_j)              for all j in the row
+S_row           := Σ_j phi_row[j]
+w[j]            := phi_row[j] / S_row
+w_sharp[j]      := w[j]^α / Σ_k (w[k]^α)   -- power-α renormalisation, α slightly > 1
+target_pre[j]   := w_sharp[j] · S_row      -- back into pre-normalisation space
 
-denom    := Σ_j B_j(s)² + δ
-for each j with B_j(s) ≠ 0:
-    c_j ← c_j + η · B_j(s) · err / denom
+-- per-score NLMS, using the snapshotted target --
+for each score s = s_i_j in the row:
+    err   := target_pre[j] − phi_row[j]
+    denom := Σ_m B_m(s)² + δ
+    for each m with B_m(s) ≠ 0:           -- only k+1 coefficients in support
+        c_m ← c_m + η · B_m(s) · err / denom
 ```
 
 Same NLMS form as Phase M; only the target changes. The target is now derived from the head's **own current attention distribution**, sharpened by raising to a power `α` slightly greater than 1 and re-normalising.
+
+**Why the row snapshot.** Without the snapshot, `Σ φ` would have to be recomputed per score after the previous score's update, which (a) makes the dynamics depend on the within-row score iteration order, breaking determinism guarantees in §9, and (b) couples the per-score updates non-linearly through the changing denominator, making the rule no longer locally analysable. The snapshot is the simplest fix that keeps the rule fully deterministic and per-coefficient local while preserving the row-level mass-budget interpretation.
 
 **Default `α = 1.1`.** Each step is a gentle multiplicative emphasis of larger weights at the expense of smaller ones. Mechanism #1 + GM=1 enforce the budget; only the *redistribution* of mass is free.
 
@@ -565,20 +587,38 @@ Same NLMS form as Phase M; only the target changes. The target is now derived fr
 
 #### 5.5.4 Why Phase D Surfaces Information Rather Than Collapsing
 
-The Phase D rule, run on its own without any constraint, would push the spline toward a one-hot distribution at the highest-scoring position — losing all attention information. **It does not, because of mechanism #1's product preservation and the GM=1 gauge.**
+The Phase D rule, run on its own without any constraint, would push the spline toward a one-hot distribution at the highest-scoring position — losing all attention information. **It does not, because the system has two conserved quantities that together forbid the one-hot configuration.**
 
-The dynamic is:
+##### Energy-conservation argument
 
-1. The Phase D rule wants to grow peaks (sharpen).
-2. Mechanism #1 preserves per-window `Π |c_j|` (M1-1).
-3. The GM=1 gauge fixes the overall product per head (GM-1).
-4. Therefore peaks **cannot grow** in absolute coefficient magnitude — they can only grow in *relative* magnitude, by drawing mass away from other regions.
+Treat each window's product `E_W := Π_{j ∈ W} |c_j|` as the **multiplicative energy** of that window, and the per-head GM as the head's **total energy**. Two invariants pin these:
 
-This forces a strict mass budget. The KAN cannot simply amplify what softmax already does. To sharpen anywhere, it must flatten elsewhere. The flattening is selective — the Phase D rule pulls mass from regions where the score signal is **inconsistent** (because the additive updates from inconsistent observations cancel) and concentrates it at regions where the score signal is **consistent** (because the updates reinforce).
+- **(M1-1) Per-window energy conservation.** Mechanism #1's redistribution operations are constructed so that every individual high-clip and low-lift step preserves `E_W` exactly (§5.2.3, §5.2.4). The cascade is a sequence of energy-preserving operations on overlapping windows.
+- **(GM-1) Per-head energy normalisation.** The gauge step pins the head's total energy `Π_j |c_j|^{1/N} = 1` (i.e. GM = 1) at the end of every inference step (§5.3).
 
-**Net effect:** the spline learns a shape with multi-modal peaks at score values that consistently carry signal in the actual inference data distribution. Score regions that softmax would have crushed (low-score tokens carrying real information) get carved out as new peaks, drawing mass from regions of the spline that were previously redundant.
+A one-hot attention output requires the spline to peak so sharply that, after row-normalisation, all but one weight is negligible. In coefficient space, this means concentrating effectively all of the head's multiplicative budget into the small number of coefficients (`≤ k+1` per support) whose basis functions activate at the dominant score region. The remaining coefficients would have to be vanishingly small.
 
-**This is the design's answer to "surface information that softmax would lose in a small model."** The combination of (a) shape freedom from B-spline parametrisation, (b) bounded budget from product preservation + gauge, (c) sharpening pressure from self-distillation, and (d) gradient-free local update produces a system that cannot grow without bound but will preferentially concentrate its mass on whatever consistently informative structure the data exhibits.
+But the per-window conservation law forbids this concentration:
+
+- Each window has fixed `E_W`, set by the previous pass's gauge step at `E_W ≈ 1` (because GM=1 implies `mean log |c_j| = 0`, so `mean E_W ≈ 1` window-by-window after a few iterations).
+- Driving any one coefficient toward `|c_j| → ∞` while keeping `E_W` fixed requires driving its window-mates toward `|c_j| → 0` in a precise compensating ratio.
+- But windows overlap (every coefficient sits in `2k+1` windows). Driving a coefficient to zero in one window drives it to zero in all `2k+1` windows it participates in, each of which then demands compensating growth in *its* window-mates.
+- The compensating-growth chains propagate through the overlap graph and meet themselves: a coefficient on the far side of the head, eventually reached by the chain, is required to grow by a factor that contradicts the chain's earlier demand for it to shrink.
+- The only configuration consistent with all `N` simultaneous per-window conservation laws is one where every `|c_j|` is finite, bounded, and strictly positive. The one-hot configuration violates this and is therefore **dynamically inaccessible**.
+
+The Phase D sharpening rule can only redistribute mass *within* the conservation-law-respecting manifold. The manifold is bounded and excludes singular configurations.
+
+##### What the rule actually does
+
+Within the allowed manifold, the rule still has a strong preference: it pulls the spline shape toward configurations where the per-row sharpened distribution `w^α / Σw^α` is the steady-state of the local update. This selects for spline shapes that make consistent score regions sharper at the expense of inconsistent ones:
+
+- At score values that consistently carry signal (the same row positions repeatedly land in this region with similar relative magnitudes), the per-row updates reinforce — `target_pre[j] − φ(s)` has a consistent sign — and the local NLMS rule grows `φ` there.
+- At score values that carry inconsistent signal (the row position lands here with random relative magnitude), the updates cancel — `target_pre[j] − φ(s)` has random sign — and `φ` does not grow.
+- The growth at consistent regions is paid for, via the conservation laws, by flattening at inconsistent regions.
+
+**Net effect:** the spline learns a shape with multi-modal peaks at score values that consistently carry signal in the actual inference data distribution. Score regions that softmax would have crushed (low-score tokens carrying real information) get carved out as new peaks, drawing mass from regions of the spline that were previously redundant. The conservation laws guarantee this redistribution is bounded; the sharpening rule guarantees it is selective.
+
+**This is the design's answer to "surface information that softmax would lose in a small model."** The combination of (a) shape freedom from B-spline parametrisation, (b) bounded budget from per-window energy conservation + gauge normalisation, (c) selective sharpening pressure from self-distillation, and (d) gradient-free local update produces a system that cannot grow without bound but will preferentially concentrate its mass on whatever consistently informative structure the data exhibits.
 
 #### 5.5.5 Cost Analysis
 
@@ -781,6 +821,7 @@ Every attention layer using this spec carries the following state, which must ro
 | `clip_rate_ema` | `float` | Per-layer rebalance activity EMA (§5.2.7). |
 | `consecutive_high_sweeps` | `int` | Per-layer counter for squaring criterion (§5.4.3). |
 | `clip_count_total` | `int[H_max]` | Per-head diagnostic counter (§5.2.7). |
+| `cascade_cap_hits` | `int` | Per-layer diagnostic counter: number of mechanism-#1 sweeps that hit `max_iter` without reaching fixed point (§5.2.6). Sustained nonzero values indicate misconfiguration. |
 | `rng_state` | `opaque` (per implementation) | Per-layer seeded RNG used for head-split perturbations (§5.4.4) and any other randomness. |
 | `grid_spec` | `(low: float, high: float, knots: int, order: int)` | Immutable B-spline grid configuration. Saved for cross-version compatibility. |
 
@@ -806,12 +847,15 @@ When loading a retrofit-source checkpoint into a KAN attention layer:
 ```
 ActiveHeads             := 2
 status[h]               := SoftmaxActive             for all h
-coefficients[h, :]      := exp_fit_on_grid(grid_spec)  for all h ∈ 0 .. H_max−1
+coefficients[h, :]      := psi_exp_fit_on_grid(grid_spec)  for all h ∈ 0 .. H_max−1
+                            -- ψ-space fit per §5.1: ψ(s) ≈ exp(s/2),
+                            -- so φ = ψ² ≈ exp(s) over the grid range
 KL_ema[h]               := +∞                         for all h
 consecutive_low_passes  := 0   for all h
 clip_rate_ema           := 0
 consecutive_high_sweeps := 0
 clip_count_total[h]     := 0
+cascade_cap_hits        := 0
 rng_state               := derived from a deterministic seed function of the
                             layer's identity (e.g. layer index + grid_spec hash)
                             so retrofit loads from the same source produce
@@ -877,11 +921,20 @@ The host library runs inference forward passes in parallel across threads in a b
 #### 9.3.1 Strategy A — Batch-Boundary Locking (default)
 
 - Forward passes for samples in a batch run **lock-free** in parallel. Each thread reads the layer's state but does not write.
-- The post-forward bookkeeping (steps 6–11 of §7) is **deferred**. Each thread accumulates `(KL_pass, NLMS update target)` deltas in thread-local buffers.
-- At batch end, a single per-layer write lock is acquired. The accumulated deltas are merged into the layer state in a deterministic order (sample-index-order within the batch). Mechanism #1, gauge, handover check, and squaring check all run once.
+- The post-forward bookkeeping (steps 6–11 of §7) is **deferred**. Each thread accumulates, in thread-local buffers:
+  - the per-coefficient additive NLMS deltas `Δc_j` (a single `H_max × N` float buffer per thread),
+  - the per-row KL contributions for `KL_pass`,
+  - any per-head clip/lift event counts.
+- At batch end, a single per-layer write lock is acquired and a deterministic merge runs:
+  1. Sum the thread-local `Δc_j` buffers across threads in **sample-index order** within the batch (addition is associative; the fixed order makes the FP result deterministic).
+  2. Apply the summed delta to the layer's coefficients in a single sweep: `c_j ← c_j + Σ_threads Δc_j`.
+  3. Run **one** mechanism-#1 sweep (cascading to fixed point) for the entire batch, not one per sample.
+  4. Run **one** GM=1 gauge step for the entire batch.
+  5. Update `KL_ema` from the summed `KL_pass` contributions.
+  6. Run handover check and squaring check once.
 - Lock acquisitions: O(1) per batch per layer.
 
-This strategy preserves determinism (the merge order is fixed and deterministic) and adds negligible overhead (one lock per batch).
+**Dynamics note.** This batch-amortised application produces dynamics that differ in detail from a hypothetical fully-serial inference (where mechanism #1 + gauge would run after every sample's update). Both behaviours are stable, deterministic, and respect the same conservation laws; the batch-amortised version is the canonical v1 dynamics, and the serial-inference dynamics are not used by any part of the spec.
 
 #### 9.3.2 Strategy B — Per-Thread Shadow Copies
 
@@ -926,16 +979,17 @@ This section consolidates every invariant introduced in §5–§9 into a single 
 ### 10.2 GM=1 Gauge Invariants (per head, after pipeline step 9)
 
 - **(GM-1) Gauge fixed.** `|G − 1| < ε_gauge`, where `ε_gauge` is at machine-precision tolerance for the head's coefficient count.
-- **(GM-2) Forward output preservation.** The attention weights computed before and after gauge renormalisation are bit-identical (modulo FP reordering).
+- **(GM-2) Forward output preservation.** The attention weights computed before and after gauge renormalisation are mathematically equal; the per-weight FP error from the rescale is bounded by `O(N · ε_machine)`.
 - **(GM-3) Sign preservation.** Gauge renormalisation preserves coefficient signs.
 
 ### 10.3 Head-Squaring Invariants (per layer, across the run)
 
 - **(HS-1) Bounded.** `2 ≤ ActiveHeads ≤ H_max` at all times.
-- **(HS-2) Power-of-2 progression.** `ActiveHeads ∈ {2, 4, 16, 256, …}` until clamped at `H_max`.
+- **(HS-2) Power-of-2 progression.** `ActiveHeads ∈ {2, 4, 16, 256, …}` at all times, including when clamped at `H_max` (which is itself constrained to be a power of 2; §5.4.2).
 - **(HS-3) Inactive masking.** Heads with index `≥ ActiveHeads` contribute zero to the layer's forward output.
 - **(HS-4) Deterministic squaring.** Squaring transitions are deterministic given the per-layer RNG state.
 - **(HS-5) Monotonicity.** `ActiveHeads` is monotonic non-decreasing across a deployment run.
+- **(HS-6) Child inheritance.** A child head spawned at squaring inherits its parent's `status`, `KL_ema`, `consecutive_low_passes`, and `clip_count_total`; only the spline coefficients are perturbed.
 
 ### 10.4 Local-Learning Invariants (per coefficient, per update)
 
@@ -956,6 +1010,7 @@ This section consolidates every invariant introduced in §5–§9 into a single 
 - **(DT-1) State-determined evolution.** Given identical saved state and identical input sequences, two runs produce bit-identical outputs and bit-identical post-state.
 - **(DT-2) No environmental randomness.** All randomness in the layer derives from the saved per-layer RNG.
 - **(DT-3) Save/load round-trip.** A model checkpointed mid-run and reloaded continues evolution as if no save/load had occurred.
+- **(DT-4) Batch-amortised application.** Under Strategy A (§9.3.1), per-batch state mutation applies the sum of thread-local NLMS deltas (in fixed sample-index order) followed by exactly one mechanism-#1 sweep and one gauge step per batch. This is the canonical v1 dynamics; serial-per-sample dynamics are not part of the spec.
 
 ### 10.7 Compositional Invariants (across mechanisms)
 
@@ -1019,7 +1074,7 @@ All parameters are per-layer-overridable. Defaults are tuned for typical transfo
 | Squaring trigger ratio | `τ_squaring = 0.10` | `clip_rate_ema > 10 %`. |
 | Sustained sweeps for squaring | `K_squaring = 64` | Avoids noise-driven squaring. |
 | Initial active heads | 2 | Specification mandate. |
-| Maximum active heads | `H_max = embedding_dim / 2` | Architectural ceiling: ≥ 2 channels per head. |
+| Maximum active heads | `H_max = largest power of 2 ≤ ⌊embedding_dim / 2⌋` | Architectural ceiling: ≥ 2 channels per head, power of 2 to keep squaring integer. |
 | Head-split perturbation σ | `σ = 0.01` | Log-normal multiplicative perturbation on cloned coefficients. |
 
 ### 11.7 Determinism / Thread Safety
@@ -1211,6 +1266,13 @@ The host library typically distinguishes training from inference via a `network.
 - During inference (`inference = true`): the full §7 pipeline is engaged.
 
 Switching the flag mid-deployment is supported but should be rare; flipping back to `inference = false` during a deployed run is undefined behaviour in this spec.
+
+**Distinction from `disable_kan_at_inference`.** The two flags address different concerns and are not interchangeable:
+
+- `inference` is the **host library's training-mode flag**. It decides whether the layer is in training (softmax forward, vanilla backward, no KAN bookkeeping) or inference (full §7 pipeline). It is set once before serving and should not be flipped during a deployed run.
+- `disable_kan_at_inference` is the **spec's emergency rollback flag** (§11.8). It runs *within* inference mode and disables the post-forward state mutation (steps 6–11 of §7), causing the layer to behave exactly as standard softmax attention while remaining "in inference" from the host library's perspective. It can be flipped at any time during a deployed run; flipping it on freezes the KAN state at its current value, flipping it off resumes evolution from that frozen state.
+
+Operators rolling back KAN behaviour mid-deployment should always reach for `disable_kan_at_inference`, never for the `inference` flag.
 
 ### 14.4 Device Placement
 
