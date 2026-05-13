@@ -120,10 +120,16 @@ implementation
 function TKANGridSpec.Hash: UInt64;
 begin
   // SplitMix64-style mix of all four fields. Stable across runs.
+  // Disable overflow / range checking: the multiplications are intentional
+  // unsigned wraparound, and Trunc() of a negative Single is cast bit-wise
+  // into UInt64. Delphi's default {$Q+}/{$R+} would raise EIntOverflow /
+  // ERangeError on these otherwise.
+  {$PUSH}{$Q-}{$R-}
   Result := UInt64(KnotCount) * UInt64($9E3779B97F4A7C15);
   Result := Result xor (UInt64(BasisOrder) * UInt64($BF58476D1CE4E5B9));
   Result := Result xor (UInt64(Trunc(GridLow * 1000)) * UInt64($94D049BB133111EB));
   Result := Result xor (UInt64(Trunc(GridHigh * 1000)) * UInt64($D6E8FEB86659FD93));
+  {$POP}
 end;
 
 // =====================================================================
@@ -137,17 +143,24 @@ end;
 
 function TKANSeededRNG.NextU64: UInt64;
 begin
+  // SplitMix64 relies on modular UInt64 arithmetic — the add and the two
+  // mixing multiplies are expected to wrap. Disable Delphi's default
+  // {$Q+}/{$R+} for the routine body.
+  {$PUSH}{$Q-}{$R-}
   State := State + UInt64($9E3779B97F4A7C15);
   Result := State;
   Result := (Result xor (Result shr 30)) * UInt64($BF58476D1CE4E5B9);
   Result := (Result xor (Result shr 27)) * UInt64($94D049BB133111EB);
   Result := Result xor (Result shr 31);
+  {$POP}
 end;
 
 function TKANSeededRNG.NextFloat: TNeuralFloat;
 begin
-  // 53-bit-equivalent uniform [0, 1); cast down to Single for TNeuralFloat.
-  Result := TNeuralFloat((NextU64 shr 11) / TNeuralFloat($1FFFFFFFFFFFFF));
+  // 53-bit-equivalent uniform [0, 1). The explicit TNeuralFloat() cast on
+  // the UInt64 operand is required for Delphi, which does not implicitly
+  // convert UInt64 to a floating-point type.
+  Result := TNeuralFloat(NextU64 shr 11) / TNeuralFloat($1FFFFFFFFFFFFF);
 end;
 
 function TKANSeededRNG.NextNormal: TNeuralFloat;
