@@ -64,9 +64,22 @@ const
   csEncodeLAB  = 3;
   csEncodeGray = 4;
 
-// TNeuralFloat / *Arr / *Ptr / TNeuralIntegerArray / csMinAvxSize are
-// provided by neuralsimd (the lowest layer) so that the AVX* kernel
-// signatures and this unit share one set of pointer types.
+// The canonical float/pointer types live in neuralsimd (the lowest
+// layer) so the AVX* kernel signatures and this unit share one type
+// identity. They are RE-EXPORTED here as weak aliases so that every
+// existing `uses neuralvolume` consumer keeps seeing TNeuralFloat etc.
+// unchanged (zero churn in the rest of the library).
+type
+  TNeuralFloat        = neuralsimd.TNeuralFloat;
+  TNeuralFloatDynArr  = neuralsimd.TNeuralFloatDynArr;
+  TNeuralFloatPtr     = neuralsimd.TNeuralFloatPtr;
+  TNeuralFloat4       = neuralsimd.TNeuralFloat4;
+  TNeuralFloatArr     = neuralsimd.TNeuralFloatArr;
+  TNeuralFloatArrPtr  = neuralsimd.TNeuralFloatArrPtr;
+  TNeuralIntegerArray = neuralsimd.TNeuralIntegerArray;
+
+const
+  csMinAvxSize = neuralsimd.csMinAvxSize;
 
 const
   csNeuralFloatSize = SizeOf(TNeuralFloat);
