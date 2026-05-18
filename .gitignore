@@ -3,6 +3,11 @@ opencl
 libs
 readme.txt
 
+# The DelphiCL OpenCL binding is vendored as a git submodule for the
+# standalone Delphi port; keep it tracked despite the bare 'opencl' rule.
+!delphi/opencl
+!delphi/opencl/**
+
 # Build artifacts
 bin/
 *.o
