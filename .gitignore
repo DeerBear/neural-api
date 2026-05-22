@@ -21,3 +21,5 @@ lib/
 # Python bytecode cache (from delphi/_port_tool.py used during the port)
 __pycache__/
 *.pyc
+*.dcu
+delphi/neural/__history
