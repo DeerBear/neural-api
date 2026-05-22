@@ -7485,7 +7485,7 @@ begin
   AVXFill(FDataPtr, c, FSize);
 end;
 
-function TNNetVolume.DotProduct(Original: TNNetVolume): TNeuralFloat; overload; inline;
+function TNNetVolume.DotProduct(Original: TNNetVolume): TNeuralFloat; inline;
 var
   I: integer;
   vHigh: integer;
@@ -7585,7 +7585,7 @@ begin
     end;
 end;
 
-class function TNNetVolume.DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; overload; inline;
+class function TNNetVolume.DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; inline;
 var
   I: integer;
   vHigh: integer;
@@ -7776,7 +7776,7 @@ begin
   begin
     SourceRawPos := Original.GetRawPtr(0, CntY, 0);
     DestRawPos := GetRawPtr(Padding, CntY + Padding, 0);
-    asm_dword_copy;
+    Move(PByte(SourceRawPos)^, PByte(DestRawPos)^, RowSize * SizeOf(TNeuralFloat));
   end;
 end;
 
@@ -7801,7 +7801,7 @@ begin
   begin
     SourceRawPos := Original.GetRawPtr(0, CntY, 0);
     DestRawPos := GetRawPtr(PaddingX, CntY + PaddingY, 0);
-    asm_dword_copy;
+    Move(PByte(SourceRawPos)^, PByte(DestRawPos)^, RowSize * SizeOf(TNeuralFloat));
   end;
 end;
 
@@ -7818,7 +7818,7 @@ begin
   RowSize := Size;
   SourceRawPos := Addr(Original.FData[0]);
   DestRawPos := Addr(FData[0]);
-  asm_dword_copy;
+  Move(PByte(SourceRawPos)^, PByte(DestRawPos)^, RowSize * SizeOf(TNeuralFloat));
 end;
 
 { TNNetGroupedVolume }
