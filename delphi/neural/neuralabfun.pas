@@ -494,7 +494,7 @@ begin
 
   if OpCode in BinaryOperationSet then
   begin
-    result := '(' + sOp1 + ' ' + csStrOp[OpCode] + ' ' + sOp2 + ')';
+    result := '(' + sOp1 + ' ' + string(csStrOp[OpCode]) + ' ' + sOp2 + ')';
     exit;
   end;
 
@@ -512,11 +512,11 @@ begin
 
   if OpCode in NoArgSet then
   begin
-    result := csStrOp[OpCode] + ' S[B]';
+    result := string(csStrOp[OpCode]) + ' S[B]';
     exit;
   end;
 
-  result := '(' + csStrOp[OpCode] + ',' + sOp1 + ',' + sOp2 + ')';
+  result := '(' + string(csStrOp[OpCode]) + ',' + sOp1 + ',' + sOp2 + ')';
 end;
 
 function TTestsClass.ToHumanString: string;
@@ -709,7 +709,7 @@ procedure TCreateValidOperations.Create(Tests, FullEqual: boolean;
   var ERRORS: array of byte);
 var
   LocalNonZeroPrevStates, NonZeroErrors: TPositionArray;
-  LocalNonZeroPrevStatesCount, NonZeroErrorsCount: integer;
+  LocalNonZeroPrevStatesCount: integer;
   LocalNumberOfPreviousStates: integer;
   LocalPreviousStates: array of byte;
   OnAction: boolean;
@@ -876,7 +876,7 @@ begin
   Clear;
   SetLength(NonZeroErrors,Self.NumberOfCurrentStates);
   NumberOfErrors := NumberOfNextStates;
-  NonZeroErrorsCount := getNonZeroElementsPos(NumberOfErrors, ERRORS, NonZeroErrors);
+  getNonZeroElementsPos(NumberOfErrors, ERRORS, NonZeroErrors);
 
   if not(FCS.TestOnStates) then RunOnActionFlag := 1
   else if not(FCS.TestOnActions) then RunOnActionFlag := 0
@@ -1022,6 +1022,7 @@ var
   efeito: byte;
   PermissibleErrors: ShortInt;
 begin
+  PermissibleErrors := 0;
   if Tests.N > 0 then
   begin
     PermissibleErrors := Tests.N - Tests.TestThreshold;
