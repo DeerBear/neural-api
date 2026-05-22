@@ -1,4 +1,4 @@
-(*
+﻿(*
 neuralvolume
 Copyright (C) 2016 Joao Paulo Schwarz Schuler
 
@@ -7485,7 +7485,7 @@ begin
   AVXFill(FDataPtr, c, FSize);
 end;
 
-function TNNetVolume.DotProduct(Original: TNNetVolume): TNeuralFloat; inline;
+function TNNetVolume.DotProduct(Original: TNNetVolume): TNeuralFloat;
 var
   I: integer;
   vHigh: integer;
@@ -7585,7 +7585,7 @@ begin
     end;
 end;
 
-class function TNNetVolume.DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; inline;
+class function TNNetVolume.DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
 var
   I: integer;
   vHigh: integer;
