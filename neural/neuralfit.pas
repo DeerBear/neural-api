@@ -52,7 +52,7 @@ type
   // SGD optimization method
   TNeuralOptimizerSGD = class(TNeuralOptimizer)
   public
-    procedure Reset(); override;
+    procedure ReSet(); override;
     procedure Optimize(); override;
   end;
 
@@ -1889,9 +1889,9 @@ end;
 
 { TNeuralOptimizerSGD }
 
-procedure TNeuralOptimizerSGD.Reset();
+procedure TNeuralOptimizerSGD.ReSet();
 begin
-  inherited Reset;
+  inherited ReSet;
   FNN.ClearInertia();
 end;
 

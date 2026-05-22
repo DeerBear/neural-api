@@ -99,7 +99,7 @@ type
   TNNetList = class(TList)
     public
       FreeObjects: boolean;
-      constructor Create(pFreeObjects: boolean = true);
+      constructor Create(pFreeObjects: boolean = true); reintroduce;
       destructor Destroy(); override;
   end;
 
@@ -123,14 +123,14 @@ type
   public
     // FData was made public to allow other fast operations
     FData: array of T;
-    constructor Create(pSizeX, pSizeY, pDepth: integer; c: T = 0);  overload; 
-    constructor Create(pInput: array of T);  overload; 
-    constructor Create(Original: array of byte);  overload; 
-    constructor Create(Original: TVolume);  overload; 
-    constructor Create(Original: TBits; pFalse: T = -0.5; pTrue: T = +0.5);  overload; 
+    constructor Create(pSizeX, pSizeY, pDepth: integer; c: T = 0); reintroduce;  overload; 
+    constructor Create(pInput: array of T); reintroduce;  overload; 
+    constructor Create(Original: array of byte); reintroduce;  overload; 
+    constructor Create(Original: TVolume); reintroduce;  overload; 
+    constructor Create(Original: TBits; pFalse: T = -0.5; pTrue: T = +0.5); reintroduce;  overload; 
     constructor CreateAsBits(Original: array of byte; pFalse: T = -0.5; pTrue: T = +0.5);  overload; 
-    constructor Create(pSize: integer; c: T = 0);  overload; 
-    constructor Create();  overload; 
+    constructor Create(pSize: integer; c: T = 0); reintroduce;  overload; 
+    constructor Create(); reintroduce;  overload; 
     destructor Destroy(); override;
     procedure Fill(c: T = 0); {$IFDEF Release} inline; {$ENDIF}
     procedure FillForIdx(c: T; const aIdx: array of integer);
@@ -518,7 +518,7 @@ type
     protected
       FTopK: integer;
     public
-      constructor Create(TopK: integer);
+      constructor Create(TopK: integer); reintroduce;
       function GetToken(Origin: TNNetVolume): integer; override;
       function GetTokenOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): integer; override;
   end;
@@ -528,7 +528,7 @@ type
     protected
       FTopP: TNeuralFloat;
     public
-      constructor Create(TopP: TNeuralFloat);
+      constructor Create(TopP: TNeuralFloat); reintroduce;
       function GetToken(Origin: TNNetVolume): integer; override;
       function GetTokenOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): integer; override;
   end;
@@ -539,8 +539,8 @@ type
       FA: TNNetVolume;
       FB: TNNetVolume;
     public
-      constructor Create(); overload;
-      constructor Create(pA, pB: TNNetVolume); overload;
+      constructor Create(); reintroduce; overload;
+      constructor Create(pA, pB: TNNetVolume); reintroduce; overload;
       constructor CreateCopying(pA, pB: TNNetVolume); overload;
 
       destructor Destroy(); override;
@@ -566,7 +566,7 @@ type
       procedure DefaultHideMessages(const S: string);
       procedure HideMessages();
 
-    published
+    public
       property MessageProc: TGetStrProc read FMessageProc write FMessageProc;
       property ErrorProc: TGetStrProc read FErrorProc write FErrorProc;
   end;
@@ -628,7 +628,7 @@ type
       FLastStepTime: double;
       FLastDistance: TNeuralFloat;
     public
-      constructor Create(pVolNum, pSizeX, pSizeY, pDepth: integer; pManhattan: boolean = true);
+      constructor Create(pVolNum, pSizeX, pSizeY, pDepth: integer; pManhattan: boolean = true); reintroduce;
       destructor Destroy(); override;
 
       procedure RunStep(RepositionClusters: boolean = true);
@@ -669,7 +669,7 @@ type
       function GetInteger(Index: Integer): PtrInt; {$IFDEF Release} inline; {$ENDIF}
       procedure PutInteger(Index: Integer; AValue: PtrInt); {$IFDEF Release} inline; {$ENDIF}
     public
-      constructor Create;
+      constructor Create; reintroduce;
       destructor Destroy; override;
       procedure LoadVocabularyFromFile(const filename: string);
 
@@ -701,7 +701,7 @@ type
       function GetList(Index: Integer): TObject;
       function CreateObject: TObject; virtual; abstract;
     public
-      constructor Create;
+      constructor Create; reintroduce;
       function AddObject(const S: string; AObject: TObject): Integer; override;
       procedure FixObjects();
 
@@ -750,7 +750,7 @@ type
     protected
       FMaxSize: integer;
     public
-      constructor Create(pMaxSize: integer);
+      constructor Create(pMaxSize: integer); reintroduce;
 
       function AddWordToDictionary(pWord:string): boolean;
       function AddWordsToDictionary(pString:string): boolean;

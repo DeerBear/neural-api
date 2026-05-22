@@ -16,6 +16,9 @@ across every unit (risk reduction vs. hand-transcribing ~50k lines).
 
 2. Compound-assignment expansion:  a += b;  ->  a := a + b;  (-=,*=,/=)
 
+3. Delphi warning fix-ups: `published` -> `public` (W1055), and
+   `reintroduce` added to hiding `constructor Create` declarations (W1010).
+
 CRITICAL: directive detection is Pascal-lexer-aware. A `{$...}` token is
 only a compiler directive when it occurs in normal code -- NEVER inside
 a string literal, a // line comment, a { } brace comment, or a (* *)
@@ -210,13 +213,76 @@ def expand_compound(text, log):
             res.append(line)
     return "\n".join(res)
 
+
+# --- Delphi warning fix-ups (W1055, W1010) ---------------------------------
+# Run after conditional resolution / compound expansion. Both passes are
+# string/comment-aware (via lex) and idempotent, so they are safe to apply
+# to fresh FPC source and to re-apply to already-ported files alike.
+
+def _comment_spans(text):
+    """Char ranges covered by string-literal / comment tokens."""
+    spans, pos = [], 0
+    for kind, s in lex(text):
+        if kind == "cmt":
+            spans.append((pos, pos + len(s)))
+        pos += len(s)
+    return spans
+
+
+def _in_spans(idx, spans):
+    return any(a <= idx < b for a, b in spans)
+
+
+def fix_published_visibility(text):
+    """Delphi W1055: a `published` section forces $M+ RTTI onto a class.
+    The ported neural-api classes never rely on published RTTI, so emit
+    `public` instead (semantically harmless, and harmless under FPC too)."""
+    spans = _comment_spans(text)
+    out, last = [], 0
+    for m in re.finditer(r"\bpublished\b", text, re.I):
+        if _in_spans(m.start(), spans):
+            continue
+        out.append(text[last:m.start()])
+        out.append("public")
+        last = m.end()
+    out.append(text[last:])
+    return "".join(out)
+
+
+_CTOR_HEAD = re.compile(r"\bconstructor\s+Create\b\s*(?:\([^()]*\))?\s*;", re.I)
+_BIND_DIR = re.compile(r"\s*(?:override|virtual|reintroduce)\b", re.I)
+
+
+def fix_hiding_constructors(text):
+    """Delphi W1010: a `constructor Create` whose signature differs from the
+    inherited virtual Create hides it. Add `reintroduce` to every Create
+    *declaration* (never an implementation `constructor T....Create`, which
+    has a qualifier between `constructor` and `Create`) that lacks
+    override/virtual/reintroduce. `reintroduce` is benign when not strictly
+    required, so the pass is safe and idempotent."""
+    spans = _comment_spans(text)
+    out, last = [], 0
+    for m in _CTOR_HEAD.finditer(text):
+        if _in_spans(m.start(), spans):
+            continue
+        if _BIND_DIR.match(text, m.end()):
+            continue
+        out.append(text[last:m.end()])
+        out.append(" reintroduce;")
+        last = m.end()
+    out.append(text[last:])
+    return "".join(out)
+
+
 if __name__ == "__main__":
     src, dst = sys.argv[1], sys.argv[2]
     raw = open(src, encoding="utf-8", errors="replace").read()
     step1 = transform_conditionals(raw)
     log = []
     step2 = expand_compound(step1, log)
-    open(dst, "w", encoding="utf-8").write(step2)
+    step3 = fix_published_visibility(step2)
+    step4 = fix_hiding_constructors(step3)
+    open(dst, "w", encoding="utf-8").write(step4)
     sys.stderr.write(f"compound-assignment rewrites: {len(log)}\n")
     for ln, a, b in log:
         sys.stderr.write(f"  L{ln}: {a}   ->   {b}\n")

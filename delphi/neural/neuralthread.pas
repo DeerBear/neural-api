@@ -85,7 +85,7 @@ type
 
     procedure Execute; override;
   public
-    constructor Create(CreateSuspended : boolean; pIndex: integer);
+    constructor Create(CreateSuspended : boolean; pIndex: integer); reintroduce;
     destructor Destroy(); override;
 
     procedure StartProc(pProc: TNeuralProc; pIndex, pThreadNum: integer); {$IFDEF Release} inline; {$ENDIF}
@@ -103,7 +103,7 @@ type
   private
     FStarted: boolean;
   public
-    constructor Create(pSize: integer);
+    constructor Create(pSize: integer); reintroduce;
     destructor Destroy; override;
 
     class procedure CalculateWorkingRange(pIndex, pThreadnum, pSize: integer; out

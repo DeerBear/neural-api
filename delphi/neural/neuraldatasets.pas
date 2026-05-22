@@ -134,7 +134,7 @@ type
       FClassCount: integer;
       {$IFDEF HASTHREADS}FCritSecLoad: TRTLCriticalSection;{$ENDIF}
     public
-      constructor Create();
+      constructor Create(); reintroduce;
       destructor Destroy(); override;
 
       procedure GetImageVolumePairFromId(ImageId: integer; vInput, vOutput: TNNetVolume; ThreadDangerous: boolean = True);
@@ -153,7 +153,7 @@ type
       FColorEncoding: integer;
       {$IFDEF HASTHREADS}FCritSecLoad: TRTLCriticalSection;{$ENDIF}
     public
-      constructor Create();
+      constructor Create(); reintroduce;
       destructor Destroy(); override;
       function CountElements(): integer;
       procedure LoadFoldersAsClasses(FolderName: string; pImageSubFolder: string = ''; SkipFirst: integer = 0; SkipLast: integer = 0);

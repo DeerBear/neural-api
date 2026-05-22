@@ -40,7 +40,7 @@ type
   { TEasyOpenCLCL }
   TEasyOpenCLCL = class(TEasyOpenCLV)
     public
-      constructor Create();
+      constructor Create(); reintroduce;
       destructor Destroy(); override;
 
       function ProbeClick(ComboPlatform, ComboDevType: TComboBox): boolean;

@@ -58,7 +58,7 @@ type
   // SGD optimization method
   TNeuralOptimizerSGD = class(TNeuralOptimizer)
   public
-    procedure Reset(); override;
+    procedure ReSet(); override;
     procedure Optimize(); override;
   end;
 
@@ -73,7 +73,7 @@ type
     constructor Create(
       Beta1: TNeuralFloat = 0.9;
       Beta2: TNeuralFloat = 0.98;
-      Epsilon: TNeuralFloat = 1e-07); overload;
+      Epsilon: TNeuralFloat = 1e-07); reintroduce; overload;
 
     // Memory Initializer for Adam optimizer
     function InitAdam(Beta1, Beta2, Epsilon: TNeuralFloat): TNNetLayer;
@@ -1736,9 +1736,9 @@ end;
 
 { TNeuralOptimizerSGD }
 
-procedure TNeuralOptimizerSGD.Reset();
+procedure TNeuralOptimizerSGD.ReSet();
 begin
-  inherited Reset;
+  inherited ReSet;
   FNN.ClearInertia();
 end;
 

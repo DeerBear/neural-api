@@ -91,9 +91,9 @@ type
     function GetBestKid(var Element: T): double;
   public
     function Evolve(Element: T; RunCnt: integer): T;
-    constructor Create(pAlwaysGetBest: boolean = False; pKidsPerFather: integer = 10);
+    constructor Create(pAlwaysGetBest: boolean = False; pKidsPerFather: integer = 10); reintroduce;
     destructor Destroy; override;
-  published
+  public
     property AlwaysGetBest: boolean read FAlwaysGetBest write FAlwaysGetBest;
     property KidsPerFather: integer read FKidsPerFather write FKidsPerFather;
     property LastEval: double read FLastEval;
