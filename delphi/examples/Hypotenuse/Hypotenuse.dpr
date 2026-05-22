@@ -26,7 +26,16 @@ uses
   Classes,
   neuralnetwork in '..\..\neural\neuralnetwork.pas',
   neuralvolume in '..\..\neural\neuralvolume.pas',
-  neuralfit in '..\..\neural\neuralfit.pas';
+  neuralfit in '..\..\neural\neuralfit.pas',
+  neuralab in '..\..\neural\neuralab.pas',
+  neuralabfun in '..\..\neural\neuralabfun.pas',
+  neuralbit in '..\..\neural\neuralbit.pas',
+  neuralbyteprediction in '..\..\neural\neuralbyteprediction.pas',
+  neuralcache in '..\..\neural\neuralcache.pas',
+  neuraldatasets in '..\..\neural\neuraldatasets.pas',
+  neuralgeneric in '..\..\neural\neuralgeneric.pas',
+  neuralsimd in '..\..\neural\neuralsimd.pas',
+  neuralthread in '..\..\neural\neuralthread.pas';
 
   function CreateHypotenusePairList(MaxCnt: integer): TNNetVolumePairList;
   var

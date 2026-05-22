@@ -27,7 +27,16 @@ uses
   neuralnetwork in '..\..\neural\neuralnetwork.pas',
   neuralvolume in '..\..\neural\neuralvolume.pas',
   neuralfit in '..\..\neural\neuralfit.pas',
-  CustApp in '..\CustApp.pas';
+  CustApp in '..\CustApp.pas',
+  neuralab in '..\..\neural\neuralab.pas',
+  neuralabfun in '..\..\neural\neuralabfun.pas',
+  neuralbit in '..\..\neural\neuralbit.pas',
+  neuralbyteprediction in '..\..\neural\neuralbyteprediction.pas',
+  neuralcache in '..\..\neural\neuralcache.pas',
+  neuraldatasets in '..\..\neural\neuraldatasets.pas',
+  neuralgeneric in '..\..\neural\neuralgeneric.pas',
+  neuralsimd in '..\..\neural\neuralsimd.pas',
+  neuralthread in '..\..\neural\neuralthread.pas';
 
 type
 

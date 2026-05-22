@@ -18,7 +18,14 @@ uses
   fphttpapp,
   httpdefs,
   httproute,
-  fpjson;
+  fpjson,
+  neuralab in '..\..\..\neural\neuralab.pas',
+  neuralabfun in '..\..\..\neural\neuralabfun.pas',
+  neuralbit in '..\..\..\neural\neuralbit.pas',
+  neuralbyteprediction in '..\..\..\neural\neuralbyteprediction.pas',
+  neuralcache in '..\..\..\neural\neuralcache.pas',
+  neuralgeneric in '..\..\..\neural\neuralgeneric.pas',
+  neuralsimd in '..\..\..\neural\neuralsimd.pas';
 
 procedure LoadBitmapIntoTinyImage(var Bitmap: TBitmap; out TI: TTinyImage);
 var

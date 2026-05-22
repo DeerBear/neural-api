@@ -19,7 +19,15 @@ uses
   neuralvolume in '..\..\neural\neuralvolume.pas',
   Math,
   neuraldatasets in '..\..\neural\neuraldatasets.pas',
-  neuralfit in '..\..\neural\neuralfit.pas';
+  neuralfit in '..\..\neural\neuralfit.pas',
+  neuralab in '..\..\neural\neuralab.pas',
+  neuralabfun in '..\..\neural\neuralabfun.pas',
+  neuralbit in '..\..\neural\neuralbit.pas',
+  neuralbyteprediction in '..\..\neural\neuralbyteprediction.pas',
+  neuralcache in '..\..\neural\neuralcache.pas',
+  neuralgeneric in '..\..\neural\neuralgeneric.pas',
+  neuralsimd in '..\..\neural\neuralsimd.pas',
+  neuralthread in '..\..\neural\neuralthread.pas';
 
 type
 

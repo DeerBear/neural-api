@@ -142,6 +142,52 @@ def fpc_cleanup(text):
     return text
 
 
+# --- neural-unit dependency closure ----------------------------------------
+# Delphi compiles each unit a .dpr references with `in '...'`, but does not
+# reliably resolve that unit's *own* dependencies from a sibling path. So the
+# .dpr must list the full transitive closure of neural units explicitly.
+
+ALL_USES_RE = re.compile(r"\buses\b(.*?);", re.I | re.S)
+
+
+def code_only(text):
+    """Just the live code: string/comment AND directive tokens removed."""
+    return "".join(s for kind, s in pt.lex(text) if kind == "code")
+
+
+def neural_uses(text):
+    """Lowercased neural-unit names referenced by any uses clause in text."""
+    deps = set()
+    for m in ALL_USES_RE.finditer(code_only(text)):
+        for name in split_uses(m.group(1)):
+            if name.lower() in NEURAL_UNITS:
+                deps.add(name.lower())
+    return deps
+
+
+def build_neural_graph():
+    """Map each delphi/neural unit -> the neural units it directly uses."""
+    graph = {}
+    for low, fname in NEURAL_UNITS.items():
+        graph[low] = neural_uses(read(os.path.join(NEURAL_DIR, fname))) - {low}
+    return graph
+
+
+NEURAL_GRAPH = build_neural_graph()
+
+
+def neural_closure(seeds):
+    """Transitive closure of neural-unit dependencies over NEURAL_GRAPH."""
+    seen, stack = set(), list(seeds)
+    while stack:
+        u = stack.pop()
+        if u in seen:
+            continue
+        seen.add(u)
+        stack.extend(NEURAL_GRAPH.get(u, set()) - seen)
+    return seen
+
+
 def add_apptype(text):
     if re.search(r"\{\$APPTYPE\b", text, re.I):
         return text
@@ -151,12 +197,14 @@ def add_apptype(text):
     return text[:m.end()] + "\n\n{$APPTYPE CONSOLE}" + text[m.end():]
 
 
-def rewrite_uses(text, depth, companions):
+def rewrite_uses(text, depth, companions, extra_neural):
     """Add explicit `in '...'` paths for neural/shim/companion units.
 
     depth: directory levels of the .dpr's dir below delphi/examples/
            (Hypotenuse -> 1, ResNet/server -> 2).
     companions: set of lowercased companion unit names.
+    extra_neural: sorted lowercased neural units to append (closure members
+           not already named in the original uses clause).
     """
     found = find_program_uses(text)
     if not found:
@@ -164,6 +212,11 @@ def rewrite_uses(text, depth, companions):
     start, end, names = found
     neural_rel = "..\\" * (depth + 1) + "neural\\"
     custapp_rel = "..\\" * depth
+
+    def neural_entry(low):
+        fname = NEURAL_UNITS[low]
+        return "%s in '%s%s'" % (os.path.splitext(fname)[0], neural_rel, fname)
+
     out = []
     for name in names:
         low = name.lower()
@@ -175,6 +228,7 @@ def rewrite_uses(text, depth, companions):
             out.append("%s in '%s.pas'" % (name, name))
         else:
             out.append(name)
+    out.extend(neural_entry(low) for low in extra_neural)
     new_uses = "uses\n  " + ",\n  ".join(out) + ";"
     return text[:start] + new_uses + text[end:]
 
@@ -198,8 +252,17 @@ def process_project(prog_path):
             if name.lower() not in NEURAL_UNITS and os.path.isfile(cand):
                 companions[name.lower()] = (name, cand)
 
+    # Full neural-unit closure: seed from the units the program and its
+    # companions use directly, then append every transitive dependency that
+    # is not already named in the program's own uses clause.
+    prog_uses_neural = neural_uses(raw)
+    seeds = set(prog_uses_neural)
+    for _, cand in companions.values():
+        seeds |= neural_uses(read(cand))
+    extra = sorted(neural_closure(seeds) - prog_uses_neural)
+
     text = add_apptype(fpc_cleanup(raw))
-    text = rewrite_uses(text, depth, set(companions))
+    text = rewrite_uses(text, depth, set(companions), extra)
     write(os.path.join(dest_dir, prog_name + ".dpr"), text)
 
     for unit_name, cand in companions.values():

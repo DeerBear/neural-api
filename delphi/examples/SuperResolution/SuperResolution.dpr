@@ -26,7 +26,14 @@ uses
   FPWritePNG,
   FPWritePNM,
   FPWriteTGA,
-  FPWriteTiff;
+  FPWriteTiff,
+  neuralab in '..\..\neural\neuralab.pas',
+  neuralabfun in '..\..\neural\neuralabfun.pas',
+  neuralbit in '..\..\neural\neuralbit.pas',
+  neuralbyteprediction in '..\..\neural\neuralbyteprediction.pas',
+  neuralcache in '..\..\neural\neuralcache.pas',
+  neuralsimd in '..\..\neural\neuralsimd.pas',
+  neuralthread in '..\..\neural\neuralthread.pas';
 
 type
   { TSuperResolutionExample }
