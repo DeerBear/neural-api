@@ -44,7 +44,7 @@ type
     FGridSpec: TKANGridSpec;
     FKnots: array of TNeuralFloat;
   public
-    constructor Create(const Spec: TKANGridSpec);
+    constructor Create(const Spec: TKANGridSpec); reintroduce;
     destructor Destroy; override;
 
     /// Evaluates the k+1 non-zero basis values at score s.

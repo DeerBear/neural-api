@@ -170,7 +170,7 @@ type
       function PrepareKernel(kernelname: string = 'cai_dot_product'): integer;
       procedure UnprepareKernel();
     public
-      constructor Create(pCurrentPlatform: cl_platform_id; pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product');
+      constructor Create(pCurrentPlatform: cl_platform_id; pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product'); reintroduce;
       destructor Destroy(); override;
 
       property Kernel: cl_kernel read FKernel;
@@ -222,7 +222,7 @@ type
 
       function Kernel(): cl_kernel; {$IFDEF Release} inline; {$ENDIF}
     public
-      constructor Create(DotProductKernel: TDotProductKernel);
+      constructor Create(DotProductKernel: TDotProductKernel); reintroduce;
       destructor Destroy(); override;
 
       procedure UnprepareForCompute();
@@ -254,7 +254,7 @@ type
       /// OpenCL Group Sizes;
       FGroupSizeA, FGroupSizeB: longint;
     public
-      constructor Create(pCurrentPlatform: cl_platform_id; pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product');
+      constructor Create(pCurrentPlatform: cl_platform_id; pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product'); reintroduce;
       destructor Destroy(); override;
 
       procedure UnprepareForCompute();

@@ -391,9 +391,9 @@ type
   // need to backpropagate errors up to the input, call EnableErrorCollection.
   TNNetInput = class(TNNetInputBase)
     public
-      constructor Create(pSize: integer); overload;
-      constructor Create(pSizeX, pSizeY, pDepth: integer); overload;
-      constructor Create(pSizeX, pSizeY, pDepth, pError: integer); overload;
+      constructor Create(pSize: integer); reintroduce; overload;
+      constructor Create(pSizeX, pSizeY, pDepth: integer); reintroduce; overload;
+      constructor Create(pSizeX, pSizeY, pDepth, pError: integer); reintroduce; overload;
 
       function EnableErrorCollection: TNNetInput;
       function DisableErrorCollection: TNNetInput;
@@ -431,7 +431,7 @@ type
   /// This layer allows you to debug activation and backpropagation of an
   TNNetDebug = class(TNNetIdentity)
     public
-      constructor Create(hasForward, hasBackward: integer); overload;
+      constructor Create(hasForward, hasBackward: integer); reintroduce; overload;
       procedure Compute(); override;
       procedure Backpropagate(); override;
   end;
@@ -444,7 +444,7 @@ type
     FPadding: integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
-    constructor Create(Padding: integer); overload;
+    constructor Create(Padding: integer); reintroduce; overload;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -459,7 +459,7 @@ type
     FPaddingX, FPaddingY: integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
-    constructor Create(PaddingX, PaddingY: integer); overload;
+    constructor Create(PaddingX, PaddingY: integer); reintroduce; overload;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -471,7 +471,7 @@ type
     FLenX, FLenY: integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
-    constructor Create(StartX, StartY, LenX, LenY: integer); overload;
+    constructor Create(StartX, StartY, LenX, LenY: integer); reintroduce; overload;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -488,7 +488,7 @@ type
   // and do not run the default optimizer.
   TNNetIdentityWithoutL2AndOptimizer = class(TNNetIdentityWithoutL2)
     public
-      constructor Create();
+      constructor Create(); reintroduce;
       procedure InitDefault(); override;
       procedure UpdateWeights(); override;
       procedure CalcAdamDelta(); override;
@@ -517,7 +517,7 @@ type
       FLowValue, FHighValue: TNeuralFloat;
       FMiddleDist: TNeuralFloat;
     public
-      constructor Create(LowValue, HighValue: integer); overload;
+      constructor Create(LowValue, HighValue: integer); reintroduce; overload;
       procedure Compute(); override;
       procedure Backpropagate(); override;
   end;
@@ -542,7 +542,7 @@ type
     private
       FScale, FLowLimit, FHighLimit: TNeuralFloat;
     public
-      constructor Create(LowLimit, HighLimit, Leakiness: integer); overload;
+      constructor Create(LowLimit, HighLimit, Leakiness: integer); reintroduce; overload;
       procedure Compute(); override;
   end;
 
@@ -550,7 +550,7 @@ type
   // can optionally make this activation function leaky.
   TNNetReLU6 = class(TNNetReLUL)
     public
-      constructor Create(Leakiness: integer = 0); overload;
+      constructor Create(Leakiness: integer = 0); reintroduce; overload;
   end;
 
   /// Scaled Exponential Linear Unit
@@ -618,7 +618,7 @@ type
     private
       FPower: TNeuralFloat;
     public
-      constructor Create(iPower: integer); overload;
+      constructor Create(iPower: integer); reintroduce; overload;
       procedure Compute(); override;
   end;
 
@@ -639,7 +639,7 @@ type
     protected
       FN: TNeuralFloat;
     public
-      constructor Create(N: TNeuralFloat); overload;
+      constructor Create(N: TNeuralFloat); reintroduce; overload;
       procedure Compute(); override;
   end;
 
@@ -681,7 +681,7 @@ type
   // learning but can also provoke overflows.
   TNNetMulLearning = class(TNNetIdentity)
     public
-      constructor Create(pMul: TNeuralFloat); overload;
+      constructor Create(pMul: TNeuralFloat); reintroduce; overload;
       procedure Backpropagate(); override;
   end;
 
@@ -701,7 +701,7 @@ type
   /// This is an experimental layer. Do not use it.
   TNNetAddAndDiv = class(TNNetIdentity)
   public
-    constructor Create(pAdd, pDiv: integer); overload;
+    constructor Create(pAdd, pDiv: integer); reintroduce; overload;
     procedure Compute(); override;
   end;
 
@@ -713,7 +713,7 @@ type
     FPositionalEmbedding: TNNetVolume;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
-    constructor Create(n: integer = 0); overload;
+    constructor Create(n: integer = 0); reintroduce; overload;
     destructor Destroy(); override;
 
     procedure Compute(); override;
@@ -730,7 +730,7 @@ type
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(pVocabSize, pEmbeddingSize: integer;
-      EncodeZero: integer = 0; ScaleEmbedding: TNeuralFloat = 0.02);
+      EncodeZero: integer = 0; ScaleEmbedding: TNeuralFloat = 0.02); reintroduce;
     destructor Destroy; override;
 
     procedure InitDefault(); override;
@@ -750,7 +750,7 @@ type
       EncodeZero: integer = 0;
       ScaleEmbedding: TNeuralFloat = 0.02;
       ScalePositional: TNeuralFloat = 0.01;
-      PositionalEmbeddingN: integer = 0);
+      PositionalEmbeddingN: integer = 0); reintroduce;
     destructor Destroy; override;
 
     procedure Compute(); override;
@@ -775,7 +775,7 @@ type
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create(Rate: double; OneMaskPerbatch: integer = 1); overload;
+      constructor Create(Rate: double; OneMaskPerbatch: integer = 1); reintroduce; overload;
       destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -792,7 +792,7 @@ type
   protected
     FRandomBias, FRandomMul: TNeuralFloat;
   public
-    constructor Create(AddRate, MulRate: integer); overload;
+    constructor Create(AddRate, MulRate: integer); reintroduce; overload;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -803,7 +803,7 @@ type
   protected
     FRandomBias, FRandomMul: TNNetVolume;
   public
-    constructor Create(AddRate, MulRate: integer); overload;
+    constructor Create(AddRate, MulRate: integer); reintroduce; overload;
     destructor Destroy; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure Compute(); override;
@@ -834,7 +834,7 @@ type
   // parameters.
   TNNetMovingStdNormalization = class(TNNetIdentityWithoutL2AndOptimizer)
     public
-      constructor Create();
+      constructor Create(); reintroduce;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       function GetMaxAbsoluteDelta(): TNeuralFloat; override;
@@ -847,7 +847,7 @@ type
       FMaxTarget: TNeuralFloat;
       FMultiplier: TNeuralFloat;
     public
-      constructor Create(pMaxTarget: TNeuralFloat = 1; pChangeRate: TNeuralFloat = 1); overload;
+      constructor Create(pMaxTarget: TNeuralFloat = 1; pChangeRate: TNeuralFloat = 1); reintroduce; overload;
       procedure Compute(); override;
       procedure Backpropagate(); override;
   end;
@@ -898,8 +898,8 @@ type
       FLayerWithChannels, FLayerMul: TNNetLayer;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create(LayerWithChannels, LayerMul: TNNetLayer); overload;
-      constructor Create(LayerWithChannelsIdx, LayerMulIdx: integer); overload;
+      constructor Create(LayerWithChannels, LayerMul: TNNetLayer); reintroduce; overload;
+      constructor Create(LayerWithChannelsIdx, LayerMulIdx: integer); reintroduce; overload;
       procedure Compute(); override;
       procedure Backpropagate(); override;
   end;
@@ -912,8 +912,8 @@ type
       FLayerA, FLayerB: TNNetLayer;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create(LayerA, LayerB: TNNetLayer); overload;
-      constructor Create(LayerAIdx, LayerBIdx: integer); overload;
+      constructor Create(LayerA, LayerB: TNNetLayer); reintroduce; overload;
+      constructor Create(LayerAIdx, LayerBIdx: integer); reintroduce; overload;
       procedure Compute(); override;
       procedure Backpropagate(); override;
   end;
@@ -986,7 +986,7 @@ type
     private
       FLRN: TNNetVolume;
     public
-      constructor Create(pSize: integer); overload;
+      constructor Create(pSize: integer); reintroduce; overload;
       destructor Destroy(); override;
 
       procedure Compute(); override;
@@ -999,7 +999,7 @@ type
       ToChannels: TNeuralIntegerArray;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create(StepSize: integer); overload;
+      constructor Create(StepSize: integer); reintroduce; overload;
       destructor Destroy(); override;
 
       procedure Compute(); override;
@@ -1018,7 +1018,7 @@ type
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create(pSizeX, pSizeY, pDepth: integer); overload;
+      constructor Create(pSizeX, pSizeY, pDepth: integer); reintroduce; overload;
 
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -1044,8 +1044,8 @@ type
   // XY size.
   TNNetConcat = class(TNNetConcatBase)
   public
-    constructor Create(pSizeX, pSizeY, pDepth: integer; aL: array of TNNetLayer); overload;
-    constructor Create(aL: array of TNNetLayer); overload;
+    constructor Create(pSizeX, pSizeY, pDepth: integer; aL: array of TNNetLayer); reintroduce; overload;
+    constructor Create(aL: array of TNNetLayer); reintroduce; overload;
 
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -1059,7 +1059,7 @@ type
     FDeepsChannel: TNeuralIntegerArray;
     FRemainingChannels: TNeuralIntegerArray;
   public
-    constructor Create(aL: array of TNNetLayer); overload;
+    constructor Create(aL: array of TNNetLayer); reintroduce; overload;
     constructor Replicate(ReplicaCount: integer; pLayer: TNNetLayer);
     destructor Destroy(); override;
 
@@ -1070,7 +1070,7 @@ type
   /// This layer sums layers of same size allowing resnet style layers.
   TNNetSum = class(TNNetConcatBase)
   public
-    constructor Create(aL: array of TNNetLayer); overload;
+    constructor Create(aL: array of TNNetLayer); reintroduce; overload;
     destructor Destroy(); override;
 
     procedure Compute(); override;
@@ -1092,8 +1092,8 @@ type
     procedure PrepareNoForwardMask;
     procedure PrepareNoForwardMaskAB(NumAs, NumBs, VectorSize: integer);
   public
-    constructor Create(A, B: TNNetLayer; NoForward:boolean = false); overload;
-    constructor Create(AIdx, BIdx: integer; NoForward:integer = 0); overload;
+    constructor Create(A, B: TNNetLayer; NoForward:boolean = false); reintroduce; overload;
+    constructor Create(AIdx, BIdx: integer; NoForward:integer = 0); reintroduce; overload;
     destructor Destroy(); override;
 
     procedure Compute(); override;
@@ -1106,8 +1106,8 @@ type
     FChannels: TNeuralIntegerArray;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
-    constructor Create(ChannelStart, ChannelLen: integer); overload;
-    constructor Create(pChannels: array of integer); overload;
+    constructor Create(ChannelStart, ChannelLen: integer); reintroduce; overload;
+    constructor Create(pChannels: array of integer); reintroduce; overload;
     destructor Destroy(); override;
 
     procedure Compute(); override;
@@ -1119,8 +1119,8 @@ type
   TNNetSplitChannelEvery = class(TNNetSplitChannels)
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
-    constructor Create(GetChannelEvery, ChannelShift: integer); overload;
-    constructor Create(pChannels: array of integer); overload;
+    constructor Create(GetChannelEvery, ChannelShift: integer); reintroduce; overload;
+    constructor Create(pChannels: array of integer); reintroduce; overload;
   end;
 
   /// Fully connected layer with hyperbolic tangent.
@@ -1131,8 +1131,8 @@ type
       procedure ComputePreviousLayerError(); override;
       procedure ComputePreviousLayerErrorCPU(); virtual;
     public
-      constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); overload; virtual;
-      constructor Create(pSize:integer; pSuppressBias: integer = 0); overload;
+      constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); reintroduce; overload; virtual;
+      constructor Create(pSize:integer; pSuppressBias: integer = 0); reintroduce; overload;
       procedure Compute(); override;
       procedure ComputeCPU(); virtual;
       procedure Backpropagate(); override;
@@ -1152,14 +1152,14 @@ type
     procedure ComputeCPU(); override;
     procedure BackpropagateCPU(); override;
     constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
-    constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pSize: integer; pSuppressBias: integer = 0); reintroduce; overload;
   end;
 
   /// Fully connected layer with Sigmoid activation function.
   TNNetFullConnectSigmoid = class(TNNetFullConnect)
   public
     constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
-    constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pSize: integer; pSuppressBias: integer = 0); reintroduce; overload;
   end;
 
   /// Fully connected layer with ReLU.
@@ -1171,7 +1171,7 @@ type
     procedure ComputeCPU(); override;
     procedure BackpropagateCPU(); override;
     constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
-    constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pSize: integer; pSuppressBias: integer = 0); reintroduce; overload;
   end;
 
   /// Do not use this layer. This is still experimental.
@@ -1180,7 +1180,7 @@ type
     procedure ComputePreviousLayerError(); override;
   public
     constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
-    constructor Create(pSize: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pSize: integer; pSuppressBias: integer = 0); reintroduce; overload;
 
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -1197,7 +1197,7 @@ type
     // Although skipping the derivative calculation is a non standard usage,
     // skipping the derivative can give higher classification accuracy at
     // image classification tasks with 10x smaller learning rate.
-    constructor Create(SkipBackpropDerivative: integer = 0; NoForward: integer = 0); overload;
+    constructor Create(SkipBackpropDerivative: integer = 0; NoForward: integer = 0); reintroduce; overload;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -1247,7 +1247,7 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure RefreshPrevSizeXDepthBytes();
     public
-      constructor Create(pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload;
+      constructor Create(pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); reintroduce; overload;
       destructor Destroy(); override;
       procedure InitDefault(); override;
   end;
@@ -1263,7 +1263,7 @@ type
     procedure ComputeCPUAtOutputPos(NeuronIdx, OutputX, OutputY: integer); {$IFDEF Release} inline; {$ENDIF}
     procedure ComputeCPUFast();
   public
-    constructor Create(pMultiplier, pFeatureSize, pInputPadding, pStride: integer); overload; virtual;
+    constructor Create(pMultiplier, pFeatureSize, pInputPadding, pStride: integer); reintroduce; overload; virtual;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     procedure InitDefault(); override;
@@ -1300,7 +1300,7 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       function ShouldUseInterleavedDotProduct:boolean; {$IFDEF Release} inline; {$ENDIF}
     public
-      constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload; virtual;
+      constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); reintroduce; overload; virtual;
       destructor Destroy(); override;
       
 
@@ -1325,7 +1325,7 @@ type
       procedure BackpropagateCPU();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pGroups: integer; pSuppressBias: integer = 0); overload; virtual;
+      constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pGroups: integer; pSuppressBias: integer = 0); reintroduce; overload; virtual;
       destructor Destroy(); override;
 
       procedure Compute(); override;
@@ -1335,7 +1335,7 @@ type
   /// This layer is under construction. DO NOT USE IT.
   TNNetGroupedConvolutionReLU = class(TNNetGroupedConvolutionLinear)
     public
-      constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pGroups: integer; pSuppressBias: integer = 0); overload; override;
+      constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pGroups: integer; pSuppressBias: integer = 0); reintroduce; overload; override;
   end;
 
   /// Grouped pointwise convolution with Linear activation.
@@ -1394,7 +1394,7 @@ type
     private
       FLinkedLayer: TNNetConvolution;
     public
-      constructor Create(LinkedLayer: TNNetLayer); overload; virtual;
+      constructor Create(LinkedLayer: TNNetLayer); reintroduce; overload; virtual;
       destructor Destroy; override;
   end;
 
@@ -1443,13 +1443,13 @@ type
   { TNNetDeconvolution }
   TNNetDeconvolution = class(TNNetConvolution)
   public
-    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); reintroduce; overload;
   end;
 
   { TNNetDeconvolutionReLU }
   TNNetDeconvolutionReLU = class(TNNetConvolutionReLU)
   public
-    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); reintroduce; overload;
   end;
 
   { TNNetLocalConnect }
@@ -1467,7 +1467,7 @@ type
   { TNNetLocalConnectLinear }
   TNNetLocalConnectLinear = class(TNNetLocalConnect)
   public
-    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload; virtual;
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); reintroduce; overload; virtual;
   end;
 
   { TNNetLocalProduct }
@@ -1486,7 +1486,7 @@ type
   { TNNetDeLocalConnect }
   TNNetDeLocalConnect = class(TNNetLocalConnect)
   public
-    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); reintroduce; overload;
   end;
 
   { TNNetLocalConnectReLU }
@@ -1498,7 +1498,7 @@ type
   { TNNetDeLocalConnectReLU }
   TNNetDeLocalConnectReLU = class(TNNetLocalConnectReLU)
   public
-    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); reintroduce; overload;
   end;
 
   { TNNetPoolBase }
@@ -1516,7 +1516,7 @@ type
       procedure BackpropagateWithStride();
       procedure ComputePreviousLayerError(); override;
     public
-      constructor Create(pPoolSize: integer; pStride:integer = 0; pPadding: integer = 0); overload;
+      constructor Create(pPoolSize: integer; pStride:integer = 0; pPadding: integer = 0); reintroduce; overload;
       destructor Destroy(); override;
       procedure BackpropagateNoTest();
       procedure Backpropagate(); override;
@@ -1547,7 +1547,7 @@ type
       constructor Create(pPoolSize: integer;
         pStride:integer = 0; pPadding: integer = 0;
         pLogPosX: integer = 1; pLogPosY: integer = 1;
-        pMaxBackpropX: integer = 0); overload;
+        pMaxBackpropX: integer = 0); reintroduce; overload;
       destructor Destroy(); override;
       procedure Backpropagate(); override;
   end;
@@ -1590,7 +1590,7 @@ type
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
-    constructor Create(pPoolSize: integer); overload;
+    constructor Create(pPoolSize: integer); reintroduce; overload;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -1610,7 +1610,7 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       function CalcOutputSize(pInputSize: integer) : integer; override;
     public
-      constructor Create(pPoolSize: integer; pSpacing: integer = 0); overload;
+      constructor Create(pPoolSize: integer; pSpacing: integer = 0); reintroduce; overload;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure ComputePreviousLayerError(); override;
@@ -1904,7 +1904,7 @@ type
       // custom layers support
       function ShouldIncDepartingBranchesCnt(pLayer: TNNetLayer):boolean; virtual;
 
-    published
+    public
       property BackwardTime: double read FBackwardTime write FBackwardTime;
       property ForwardTime: double read FForwardTime write FForwardTime;
       property Layers: TNNetLayerList read FLayers;
@@ -2012,8 +2012,8 @@ type
       property Items[Index: Integer]: TNNet read GetItem write SetItem; default;
   
     public
-      constructor Create(CloneNN: TNNet; pSize: integer; pFreeObjects: Boolean = True);  overload; 
-      constructor Create(pSize: integer; pFreeObjects: Boolean = True);  overload; 
+      constructor Create(CloneNN: TNNet; pSize: integer; pFreeObjects: Boolean = True); reintroduce;  overload; 
+      constructor Create(pSize: integer; pFreeObjects: Boolean = True); reintroduce;  overload; 
 
       procedure SetLearningRate(pLearningRate, pInertia: TNeuralFloat);
       procedure SetBatchUpdate(pBatchUpdate: boolean);
@@ -2040,7 +2040,7 @@ type
       FActionBytes: array of byte;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create(CacheSize, TestCount, OperationCount: integer); overload;
+      constructor Create(CacheSize, TestCount, OperationCount: integer); reintroduce; overload;
       destructor Destroy; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -2080,7 +2080,7 @@ type
       // the higher the number, more computations are used on each step. If you don't know what number to use, give 40.
       CacheSize: integer
       // replies the same prediction for the same given state. Use false if you aren't sure.
-    );
+    ); reintroduce;
     destructor Destroy(); override;
 
     // THIS METHOD WILL PREDICT THE NEXT SATE GIVEN AN ARRAY OF ACTIONS AND STATES.
@@ -2107,7 +2107,7 @@ type
       NumNeurons: integer;
       // the higher the number, more computations are used on each step. If you don't know what number to use, give 40.
       CacheSize: integer
-    );
+    ); reintroduce;
     destructor Destroy(); override;
   end;
 

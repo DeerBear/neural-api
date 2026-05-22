@@ -85,7 +85,7 @@ type
                        const TauSquaring: TNeuralFloat = 0.10;
                        const KSquaring: integer = 64;
                        const ClipRateEmaLambda: TNeuralFloat = 0.01;
-                       const InitialActiveHeads: integer = 2);
+                       const InitialActiveHeads: integer = 2); reintroduce;
     destructor Destroy; override;
 
     procedure RegisterNormaliser(const N: TNNetKANNormaliser);
