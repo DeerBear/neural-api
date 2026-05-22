@@ -2693,13 +2693,11 @@ var
   Word: string;
   WordCount: string;
   FileHandler: TextFile;
-  LineCnt: integer;
 begin
   Clear;
   Sep := CreateTokenizedStringList(Separator);
   AssignFile(FileHandler, Filename);
   Reset(FileHandler);
-  LineCnt := 0;
   while not Eof(FileHandler) do
   begin
     ReadLn(FileHandler, CurrentLine);
@@ -2713,7 +2711,6 @@ begin
       {$ELSE}
       Self.AddInteger(Sep[0],StrToInt(Sep[1]));
       {$ENDIF}
-      LineCnt := LineCnt + 1;
     end
     else
     begin
@@ -2937,7 +2934,6 @@ end;
 procedure TNNetVolumeList.AddValue(Value: TNeuralFloat);
 var
   I: integer;
-  AuxVolume: TNNetVolume;
 begin
   if (Count>0) then
   begin
@@ -2951,7 +2947,6 @@ end;
 procedure TNNetVolumeList.Mul(Value: TNeuralFloat);
 var
   I: integer;
-  AuxVolume: TNNetVolume;
 begin
   if (Count>0) then
   begin
@@ -2965,7 +2960,6 @@ end;
 procedure TNNetVolumeList.Divi(Value: TNeuralFloat);
 var
   I: integer;
-  AuxVolume: TNNetVolume;
 begin
   if (Count>0) then
   begin
@@ -3435,6 +3429,7 @@ var
   r, x, y: TNeuralFloat;
 begin
   r := 0;
+  x := 0;
   // loop executed 4 / pi = 1.273.. times on average
   while ( (r > 1) or (r = 0) ) do
   begin
@@ -4063,7 +4058,6 @@ var
   I: integer;
   vHigh: integer;
   BasePos: integer;
-  AddrA, AddrB: TNeuralFloatPtr;
 begin
   BasePos := 0;
   vHigh := pSize - 1;
@@ -4086,7 +4080,6 @@ var
   I: integer;
   vHigh: integer;
   BasePos: integer;
-  AddrA, AddrB: TNeuralFloatPtr;
 begin
   BasePos := 0;
   vHigh := pSize - 1;
@@ -4108,12 +4101,8 @@ var
   I: integer;
   vHigh: integer;
   BasePos: integer;
-  AddrA, AddrB, AddrC: TNeuralFloatPtr;
 begin
   BasePos := 0;
-  AddrA := pointer(PtrA);
-  AddrB := pointer(PtrB);
-  AddrC := pointer(PtrC);
   vHigh := pSize - 1;
   
   if BasePos <= vHigh then for I := BasePos to vHigh do
@@ -5077,7 +5066,6 @@ begin
     auxSingle := FData[0];
     FLastPos := 0;
     Result := auxSingle;
-    if auxSingle < 0 then auxSingle := -auxSingle;
     vHigh := High(FData);
     if vHigh > 0 then
     begin
@@ -5903,7 +5891,6 @@ begin
     begin
       for CountY := 0 to MaxY do
       begin
-        StartPointPos := GetRawPos(CountX, CountY);
         for GroupCnt := 0 to Groups-1 do
         begin
           StartD := ChannelsPerGroup * GroupCnt;
@@ -6068,7 +6055,7 @@ end;
 
 function TVolume.ReverseGroupedOneHotEncodingOnPixel(Groups, X, Y: integer): integer;
 var
-  CntToken, MaxToken, Token: integer;
+  Token: integer;
   GroupSize, MaxGroupSize, GroupCnt, MaxGroup, TokenMod: integer;
   GroupSizePower: integer;
   InitTokenPos: integer;
@@ -6076,8 +6063,6 @@ var
   MaxValue: TNeuralFloat;
   MaxTokenMod: integer;
 begin
-  // Calculate maximum token index
-  MaxToken := FSizeX - 1;
   // Calculate size of each group
   GroupSize := FDepth div Groups;
   MaxGroupSize := GroupSize - 1;
@@ -6725,15 +6710,12 @@ end;
 procedure TVolume.LoadFromString(strData: string);
 var
   S: TStringList;
-  version: integer;
   pSizeX, pSizeY, pDepth: integer;
   I: integer;
   AuxFloat: Single;
 begin
-  version := 1;
   S := CreateTokenizedStringList(strData,';');
 
-  version := StrToInt(S[0]);
   pSizeX  := StrToInt(S[1]);
   pSizeY  := StrToInt(S[2]);
   pDepth  := StrToInt(S[3]);
@@ -7016,22 +6998,13 @@ procedure TNNetVolume.DotProducts(NumAs, NumBs, VectorSize: integer;
   VAs, VBs: TNNetVolume;
   NoForward:boolean = false);
 var
-  CntA, CntB, CntAPos, CntBPos, MaxA, LocalMaxA, MaxB: integer;
-  DestPointer: pointer;
-  CntBVectorSizePlusCntBPos: integer;
-  vRes: array[0..3] of Single;
-  localNumElements, MissedElements: integer;
+  CntA, CntB, MaxA, LocalMaxA, MaxB: integer;
   PtrA, PtrB: TNeuralFloatArrPtr;
   Result: TNeuralFloat;
   //PointwiseMinValue: TNeuralFloat;
 begin
   MaxA := NumAs - 1;
   MaxB := NumBs - 1;
-
-  //localNumElements := (VectorSize div 4) * 4;
-  //MissedElements := VectorSize - localNumElements;
-  MissedElements := VectorSize and 3;
-  localNumElements := VectorSize xor MissedElements;
 
   if NoForward then Fill(0);
 
@@ -7077,11 +7050,10 @@ end;
 
 procedure TNNetVolume.DotProductsTiled(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
 var
-  CntA, CntB, CntAPos, CntBPos, MaxA, MaxB: integer;
+  CntA, CntB: integer;
   DestPointer: pointer;
   CntBVectorSizePlusCntBPos: integer;
   vRes: array[0..3] of Single;
-  localNumElements, MissedElements: integer;
   PtrA, PtrB: TNeuralFloatArrPtr;
   Result: TNeuralFloat;
   // Tiling
@@ -7089,13 +7061,6 @@ var
   StartTileA, EndTileA, StartTileB, EndTileB: integer;
   MaxTileA, MaxTileB: integer;
 begin
-  MaxA := NumAs - 1;
-  MaxB := NumBs - 1;
-
-  //localNumElements := (VectorSize div 4) * 4;
-  //MissedElements := VectorSize - localNumElements;
-  MissedElements := VectorSize and 3;
-  localNumElements := VectorSize xor MissedElements;
   MaxTileA := (NumAs div TileSizeA) - 1;
   MaxTileB := (NumBs div TileSizeB) - 1;
   for TileBCnt := 0 to MaxTileB do
@@ -7834,7 +7799,6 @@ class function TVolume.DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: i
 var
   I: integer;
   BasePos, vHigh: integer;
-  AddrA, AddrB: TNeuralFloatPtr;
 begin
   Result := 0;
   BasePos := 0;

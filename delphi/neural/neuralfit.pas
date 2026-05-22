@@ -1564,8 +1564,6 @@ begin
 end;
 
 procedure TNeuralDataLoadingFit.RunTrainingBatch();
-var
-  MaxDelta: TNeuralFloat;
 begin
   FGlobalHit       := 0;
   FGlobalMiss      := 0;
@@ -1718,7 +1716,7 @@ begin
   end else if FFit.FClipDelta > 0 then
   begin
     //MaxDelta := FNN.ForceMaxAbsoluteDelta(FFit.FClipDelta);
-    MaxDelta := FNN.NormalizeMinMaxAbsoluteDeltaPerLayer(0, FFit.FClipDelta);
+    FNN.NormalizeMinMaxAbsoluteDeltaPerLayer(0, FFit.FClipDelta);
   end
   else
   begin

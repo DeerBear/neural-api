@@ -380,6 +380,7 @@ begin
   NextState[0] := pLabel;
   FStates[FNextFreePos].FTester.Load(FCS, pState, CurrentState, NextState);
 
+  Result := FNextFreePos;
   Inc(FNextFreePos);
 end;
 
@@ -724,6 +725,7 @@ var
   idxCache: longint;
   Equal: boolean;
 begin
+  idxCache := -1;
   ABCopy(aActions, pActions);
   ABCopy(aCurrentState, pCurrentState);
   if FUseCache then
@@ -868,23 +870,13 @@ procedure TStatePredictionClass.AddNeuronsFromStringFromPos(var str: string; pos
 var
   S: TStringList;
   neuronPos: longint;
-  version: integer;
-  evaluation: integer;
-  pActionLen: integer;
-  pStatelen: integer;
   inputNeuronCnt: integer;
 begin
-  version := 1;
   S := TStringList.Create;
   S.Sorted := false;
   S.Delimiter := chr(10);
   S.StrictDelimiter := true;
   S.DelimitedText := str;
-
-  version := StrToInt(S[0]);
-  evaluation := StrToInt(S[1]);
-  pActionLen := StrToInt(S[2]);
-  pStatelen := StrToInt(S[3]);
 
   //TODO: treat above info here.
 
@@ -1065,7 +1057,6 @@ begin
 
     if (Actual > Best) then
     begin
-      Best := actual;
       posBest := neuronPos;
       R := True;
       Result := R;

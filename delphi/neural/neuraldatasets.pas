@@ -371,7 +371,7 @@ procedure FindAllDirectories(AList: TStrings; const SearchPath: String;
   SearchSubDirs: Boolean = true; PathSeparator: char = ';');
 var
   dirs: TStringDynArray;
-  dir, Path, SearchPattern: ShortString;
+  dir, Path, SearchPattern: string;
   SearchOption: TSearchOption;
 begin
   if SearchSubDirs
@@ -391,7 +391,7 @@ procedure FindAllFiles(AList: TStrings; const SearchPath: String;
   MaskSeparator: char = ';'; PathSeparator: char = ';');
 var
   fileNames: TStringDynArray;
-  fileName, Path, SearchPattern: ShortString;
+  fileName, Path, SearchPattern: string;
   SearchOption: TSearchOption;
 begin
   if SearchSubDirs
@@ -592,13 +592,12 @@ var
   ExpectedTokenInt: integer;
   AIntegerArray: TNeuralIntegerArray;
   pInput, pOutput: TNNetVolume;
-  CntHit, CntMiss: integer;
+  CntHit: integer;
   InputString: string;
 begin
   pInput := TNNetVolume.Create();
   pOutput := TNNetVolume.Create();
   CntHit := 0;
-  CntMiss := 0;
   // Make sure that expected input and output have the proper sizes.
   if NN.GetFirstLayer().Output.Size <> pInput.Size then pInput.ReSize(NN.GetFirstLayer().Output);
   if NN.GetLastLayer().Output.Size <> pOutput.Size then pOutput.ReSize(NN.GetLastLayer().Output);
@@ -628,10 +627,6 @@ begin
         WriteLn(InputString,'-->',Dict.IntegerToWord(ExpectedTokenInt));
         WriteLn(GenerateStringFromTokens(NN, Dict, InputString, nil),'.');
       end;
-    end
-    else
-    begin
-      Inc(CntMiss);
     end;
   end;
   WriteLn('Pos: ',Pos,' Hit:',CntHit);
@@ -955,7 +950,6 @@ end;
 
 procedure TClassesAndElements.AddFileNamesTo(FileNames: TFileNameList);
 var
-  SourceVolume: TNNetVolume;
   ClassId, FileId: integer;
   MaxClassId, MaxFileId: integer;
 begin
@@ -1044,6 +1038,7 @@ begin
   LocalPicture.LoadFromFile( ImageFileName );
   {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSecLoad);{$ENDIF}
   LoadPictureIntoVolume(LocalPicture, V);
+  Result := True;
   LocalPicture.Free;
 end;
 
