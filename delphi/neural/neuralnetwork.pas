@@ -3565,7 +3565,6 @@ var
   ChannelsPerGroup, ChannelsPerGroupSize: integer;
   yCount, xCount, groupCount: integer;
   InputX, InputY: integer;
-  RowSize: integer;
   FeatureSizeXYD: integer;
 begin
   if (FPointwise) then
@@ -3575,7 +3574,6 @@ begin
   else
   begin
     ChannelsPerGroup := FInputCopy.Depth div FStruct[5];
-    RowSize := ChannelsPerGroup;
     ChannelsPerGroupSize := ChannelsPerGroup * SizeOf(TNeuralFloat);
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
@@ -4595,25 +4593,20 @@ end;
 procedure TNNetLocalProduct.ComputeCPU();
 var
   OutputCntX, OutputCntY, OutputCntD: integer;
-  InputCntX, InputCntY: integer;
   MaxX, MaxY, MaxD: integer;
   LocalSize: integer;
   PtrA: TNeuralFloatArrPtr;
   OutputIdx: integer;
   Product: TNeuralFloat;
-  CntXYD: integer;
 begin
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := FOutput.Depth - 1;
 
   LocalSize := FFeatureSizeX*FFeatureSizeY*FInputCopy.Depth;
-  InputCntX := 0;
   OutputCntX := 0;
-  CntXYD := 0;
   while OutputCntX <= MaxX do
   begin
-    InputCntY := 0;
     OutputCntY := 0;
     while OutputCntY <= MaxY do
     begin
@@ -4628,12 +4621,9 @@ begin
         FOutputRaw.FData[OutputIdx] := Product;
         FOutput.FData[OutputIdx] := Product;
         Inc(OutputCntD);
-        Inc(CntXYD);
       end;
-      Inc(InputCntY, FStride);
       Inc(OutputCntY);
     end;
-    Inc(InputCntX, FStride);
     Inc(OutputCntX);
   end;
   (*
@@ -8623,7 +8613,6 @@ var
   NN: THistoricalNets;
   NN2: TNNet;
   AuxVolume: TNNetVolume;
-  I: integer;
 begin
   NN := THistoricalNets.Create();
   AuxVolume := TNNetVolume.Create;
@@ -9289,7 +9278,6 @@ var
   RawPos, PrevRawPos: integer;
   PrevPosX, PrevPosY: integer;
   floatPoolSize: TNeuralFloat;
-  OutX, OutY: integer;
 begin
   MaxD := Output.Depth - 1;
 
@@ -9479,14 +9467,12 @@ end;
 
 procedure TNNetReshape.Backpropagate;
 var
-  Len: integer;
   StartTime: double;
 begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
-  Len := Min(FOutput.Size, FPrevLayer.FOutput.Size);
   //TODO: check this for possible crash.
   FPrevLayer.FOutputError.Add(FOutputError);
   FBackwardTime := FBackwardTime + (Now() - StartTime);
