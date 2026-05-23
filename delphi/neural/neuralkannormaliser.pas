@@ -492,10 +492,85 @@ end;
 
 procedure TNNetKANNormaliser.NLMSPhaseD(const ScoresRow: TNNetVolume;
                                          const RowIdx, RowLen: integer);
+// Spec 5.5.3: Phase D self-distillation sharpening. Row-snapshotted target
+// derived from the head's own current attention distribution, sharpened by
+// power alpha.
+//   w[j]          := FWKANRow[j]                           (= phi_row / S_row)
+//   w_sharp[j]    := w[j]^alpha / sum_k(w[k]^alpha)
+//   target_pre[j] := w_sharp[j] * S_row                    (back into phi-units)
+//   for each score s = ScoresRow at (RowIdx, J):
+//     err   := target_pre[j] - phi_row[j]
+//     denom := sum_m B_m(s)^2 + delta
+//     c_m   := c_m + eta * B_m(s) * err / denom            (only k+1 m's hit)
+//
+// Pipeline preconditions (caller responsibility, met by §7 ordering):
+//   - EvaluateSplineRow has populated FPhiRow + FRowSum for this row.
+//   - ComputeWeightsRow has populated FWKANRow for this row.
+//
+// Per spec 5.5.3 "row snapshot" rationale: FPhiRow / FRowSum / FWKANRow are
+// frozen for this row's per-score updates. The next row's EvaluateSplineRow
+// recomputes them from the now-updated coefficients.
+//
+// Chain-rule note: spec 5.5.3's NLMS step c_m += eta * B_m * err / denom is
+// the linear-in-c form. Under 5.1's phi = psi^2 parametrisation, the proper
+// phi-space gradient step would carry an additional 2*psi factor (chain
+// rule). The spec writes the simpler form; this implementation follows it.
+// Direction is correct (sign-preserving when psi > 0, held by GM=1 + sign
+// preservation); magnitude is auto-tuned by NLMS denom; mechanism #1 + gauge
+// keep coefficients bounded. (Spec note: 5.5.3 should clarify whether
+// chain-rule omission is intentional.)
+//
+// Same Depth-stride indexing as EvaluateSplineRow.
+var
+  J, FirstIdx, M, KnotN, D: integer;
+  S, SumSharp, Err, Denom, Step: TNeuralFloat;
+  BasisVals: array[0..3] of TNeuralFloat;
 begin
-  // TODO: per-score NLMS toward sharpened target derived from FRowSum
-  // and FWKANRow snapshot; α-power renormalisation (spec §5.5.3).
-  raise EKANBadState.Create('TNNetKANNormaliser.NLMSPhaseD: not implemented');
+  if Length(FWSharpRow) < RowLen then SetLength(FWSharpRow, RowLen);
+  if Length(FTargetPreRow) < RowLen then SetLength(FTargetPreRow, RowLen);
+
+  // Pathological row: phi_row was all-zero (EvaluateSplineRow set FRowSum to
+  // 0 and FWKANRow to zeros). Next pass, after mechanism #1 has corrected
+  // any coefficient state that produced this, will give a usable target.
+  if FRowSum <= 0 then exit;
+
+  // w_sharp[j] = w[j]^alpha / sum(w[k]^alpha)
+  SumSharp := 0;
+  for J := 0 to RowLen - 1 do
+  begin
+    FWSharpRow[J] := Power(FWKANRow[J], FSharpenAlpha);
+    SumSharp := SumSharp + FWSharpRow[J];
+  end;
+  if SumSharp <= 0 then exit;  // all-zero w: defer to next pass
+
+  // target_pre[j] = w_sharp[j] * S_row, in phi-units (matches FPhiRow units).
+  for J := 0 to RowLen - 1 do
+  begin
+    FWSharpRow[J] := FWSharpRow[J] / SumSharp;
+    FTargetPreRow[J] := FWSharpRow[J] * FRowSum;
+  end;
+
+  // Per-score NLMS against the snapshotted target.
+  KnotN := Length(FHead.Coeffs);
+  D := ScoresRow.Depth;
+  for J := 0 to RowLen - 1 do
+  begin
+    S := ScoresRow.Raw[J * D + RowIdx];
+    FBasis.Evaluate(S, FirstIdx, BasisVals);
+    Denom := FNlmsDelta;
+    for M := 0 to 3 do
+    begin
+      if (FirstIdx + M >= 0) and (FirstIdx + M < KnotN) then
+        Denom := Denom + BasisVals[M] * BasisVals[M];
+    end;
+    Err := FTargetPreRow[J] - FPhiRow[J];
+    Step := FNlmsEta * Err / Denom;
+    for M := 0 to 3 do
+    begin
+      if (FirstIdx + M >= 0) and (FirstIdx + M < KnotN) then
+        FHead.Coeffs[FirstIdx + M] := FHead.Coeffs[FirstIdx + M] + Step * BasisVals[M];
+    end;
+  end;
 end;
 
 function TNNetKANNormaliser.WindowGM(const I: integer): TNeuralFloat;
