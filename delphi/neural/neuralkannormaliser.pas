@@ -130,6 +130,8 @@ type
     function  WindowGM(const I: integer): TNeuralFloat;
     function  ResolveShareMode(const IsHighClip: boolean;
                                const LayerClipRate: TNeuralFloat): TKANShareRule;
+    function  HighClipAt(const I: integer; const G: TNeuralFloat;
+                         const LayerClipRate: TNeuralFloat): boolean;
 
     procedure Mechanism1Sweep;
     procedure GaugeRenormalise;
@@ -496,6 +498,87 @@ begin
   // Mode C (clip_rate > tau_stressed OR in hysteresis band)
   if IsHighClip then Exit(ksrInverseProportional)
   else               Exit(ksrProportional);
+end;
+
+function TNNetKANNormaliser.HighClipAt(const I: integer; const G: TNeuralFloat;
+                                       const LayerClipRate: TNeuralFloat): boolean;
+// Spec 5.2.3: if |c_i| > 3*g, clip it down to 3*g (sign-preserving) and
+// redistribute the multiplicative excess r = |c_i_old|/|c_i_new| > 1
+// across the other 2k window coefficients via positive factors
+// f_j = r^{s_j} with share weights s_j summing to 1 (5.2.5). The
+// per-window product |c_i| * Pi_{j!=i}|c_j| is preserved exactly:
+//     Pi_new = (|c_i|/r) * Pi_{j!=i}(|c_j| * f_j)
+//            = (|c_i|/r) * r * Pi_{j!=i}|c_j|  =  Pi_old              (M1-1)
+// All factors are positive, so coefficient signs are preserved (M1-2).
+// Returns true iff a clip actually fired.
+var
+  J, K, Lo, Hi, N: integer;
+  AbsOld, AbsNew, R, LogR, ShareTotal, ShareJ, Factor, SignI: TNeuralFloat;
+  ShareWeights: array of TNeuralFloat;
+  Rule: TKANShareRule;
+const
+  CFloor = 1e-30;
+begin
+  Result := False;
+  AbsOld := Abs(FHead.Coeffs[I]);
+  AbsNew := 3.0 * G;
+  if AbsOld <= AbsNew then exit;
+
+  // Clip the offending coefficient.
+  if FHead.Coeffs[I] >= 0 then SignI := 1 else SignI := -1;
+  FHead.Coeffs[I] := SignI * AbsNew;
+
+  R := AbsOld / AbsNew;
+  if R <= 1 then exit;
+  LogR := Ln(R);
+
+  // Window (clamped at array boundaries).
+  K := FGridSpec.BasisOrder;
+  N := Length(FHead.Coeffs);
+  Lo := Max(0, I - K);
+  Hi := Min(N - 1, I + K);
+
+  Rule := ResolveShareMode({IsHighClip=}True, LayerClipRate);
+
+  // Compute raw share weights s_j over j != i in window.
+  SetLength(ShareWeights, Hi - Lo + 1);
+  ShareTotal := 0;
+  for J := Lo to Hi do
+  begin
+    if J = I then
+    begin
+      ShareWeights[J - Lo] := 0;
+      Continue;
+    end;
+    case Rule of
+      ksrProportional:        ShareJ := Max(Abs(FHead.Coeffs[J]), CFloor);
+      ksrInverseProportional: ShareJ := 1 / Max(Abs(FHead.Coeffs[J]), CFloor);
+    else                       ShareJ := Max(Abs(FHead.Coeffs[J]), CFloor);
+    end;
+    ShareWeights[J - Lo] := ShareJ;
+    ShareTotal := ShareTotal + ShareJ;
+  end;
+
+  // Singleton window or all-zero neighbours: no redistribution possible.
+  // The clip still stood; window product is no longer preserved at the
+  // boundary, but the cascade's next iteration will absorb the residual.
+  if ShareTotal <= 0 then
+  begin
+    Result := True;
+    exit;
+  end;
+
+  // Apply factors: f_j = R^{s_j / ShareTotal}; exponents sum to 1, so the
+  // product of factors is exactly R.
+  for J := Lo to Hi do
+  begin
+    if J = I then Continue;
+    if ShareWeights[J - Lo] <= 0 then Continue;
+    Factor := Exp((ShareWeights[J - Lo] / ShareTotal) * LogR);
+    FHead.Coeffs[J] := FHead.Coeffs[J] * Factor;
+  end;
+
+  Result := True;
 end;
 
 procedure TNNetKANNormaliser.Mechanism1Sweep;
