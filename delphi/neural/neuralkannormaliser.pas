@@ -303,13 +303,41 @@ end;
 
 procedure TNNetKANNormaliser.EvaluateSplineRow(const ScoresRow: TNNetVolume;
                                                  const RowIdx, RowLen: integer);
+// Spec 5.1: psi(s) = sum_m c_m * B_m(s) over the k+1 active basis functions;
+// phi(s) = psi^2 by construction (5.3 gauge premise). Writes phi for every
+// column of this row into FPhiRow, snapshots the row total in FRowSum --
+// the latter is consumed by ComputeWeightsRow (5.5.1) and (post-takeover)
+// by NLMSPhaseD's sharpened-target derivation (5.5.3).
+//
+// Indexing: this layer is per-head; the score tensor's Depth axis identifies
+// rows (per impl-doc 5.3 pseudocode `for rowIdx in 0..FOutput.Depth - 1`).
+// CAI volumes lay out Raw[] with Depth varying fastest, so column j of row
+// RowIdx is at flat offset j*Depth + RowIdx. FBasis.Evaluate handles out-of-
+// range knot indices by writing 0 to the corresponding basis value, so the
+// bounds check below is a safety guard against indexing the coefficient
+// array out of range (Debug builds range-check); the math is unaffected.
+var
+  J, FirstIdx, M, KnotN, D: integer;
+  S, Psi: TNeuralFloat;
+  BasisVals: array[0..3] of TNeuralFloat;
 begin
-  // TODO: for each column j in row RowIdx of ScoresRow,
-  //   ψ(s) := Σ_m c_m · B_m(s)  (k+1 active basis functions)
-  //   φ(s) := ψ(s)²
-  //   FPhiRow[j] := φ(s)
-  // Then FRowSum := Σ_j FPhiRow[j]   -- snapshot for Phase D (spec §5.5.3)
-  raise EKANBadState.Create('TNNetKANNormaliser.EvaluateSplineRow: not implemented');
+  if Length(FPhiRow) < RowLen then SetLength(FPhiRow, RowLen);
+  KnotN := Length(FHead.Coeffs);
+  D := ScoresRow.Depth;
+  FRowSum := 0;
+  for J := 0 to RowLen - 1 do
+  begin
+    S := ScoresRow.Raw[J * D + RowIdx];
+    FBasis.Evaluate(S, FirstIdx, BasisVals);
+    Psi := 0;
+    for M := 0 to 3 do
+    begin
+      if (FirstIdx + M >= 0) and (FirstIdx + M < KnotN) then
+        Psi := Psi + FHead.Coeffs[FirstIdx + M] * BasisVals[M];
+    end;
+    FPhiRow[J] := Psi * Psi;
+    FRowSum := FRowSum + FPhiRow[J];
+  end;
 end;
 
 procedure TNNetKANNormaliser.ComputeWeightsRow(const ScoresRow: TNNetVolume;
