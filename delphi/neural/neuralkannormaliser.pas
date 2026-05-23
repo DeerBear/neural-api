@@ -132,6 +132,8 @@ type
                                const LayerClipRate: TNeuralFloat): TKANShareRule;
     function  HighClipAt(const I: integer; const G: TNeuralFloat;
                          const LayerClipRate: TNeuralFloat): boolean;
+    function  LowLiftAt(const I: integer; const G: TNeuralFloat;
+                        const LayerClipRate: TNeuralFloat): boolean;
 
     procedure Mechanism1Sweep;
     procedure GaugeRenormalise;
@@ -575,6 +577,84 @@ begin
     if J = I then Continue;
     if ShareWeights[J - Lo] <= 0 then Continue;
     Factor := Exp((ShareWeights[J - Lo] / ShareTotal) * LogR);
+    FHead.Coeffs[J] := FHead.Coeffs[J] * Factor;
+  end;
+
+  Result := True;
+end;
+
+function TNNetKANNormaliser.LowLiftAt(const I: integer; const G: TNeuralFloat;
+                                      const LayerClipRate: TNeuralFloat): boolean;
+// Spec 5.2.4 (productivity rule): if |c_i| < g/2, lift it to |c_i| := g
+// (not just to the threshold -- the asymmetric 5.2.4 design) and shrink
+// the other window coefficients by f_j = (1/q)^{s_j / sum(s)} where
+// q = |c_i_new| / |c_i_old| > 1. Per-window product preserved (M1-1):
+//     Pi_new = (|c_i| * q) * Pi_{j!=i}(|c_j| * f_j)
+//            = (|c_i| * q) * (1/q) * Pi_{j!=i}|c_j|  =  Pi_old
+// The asymmetric threshold (g/2 vs the high-clip 3*g) makes low-lift do
+// productivity work, not numerical safety; the asymmetry is what makes
+// head-squaring's capacity signal meaningful (5.2.4 rationale).
+// Returns true iff a lift actually fired.
+var
+  J, K, Lo, Hi, N: integer;
+  AbsOld, AbsNew, Q, LogQ, ShareTotal, ShareJ, Factor, SignI: TNeuralFloat;
+  ShareWeights: array of TNeuralFloat;
+  Rule: TKANShareRule;
+const
+  CFloor = 1e-30;
+begin
+  Result := False;
+  AbsOld := Abs(FHead.Coeffs[I]);
+  if AbsOld >= 0.5 * G then exit;
+
+  // Lift toward GM.
+  AbsNew := G;
+  if FHead.Coeffs[I] >= 0 then SignI := 1 else SignI := -1;
+  FHead.Coeffs[I] := SignI * AbsNew;
+
+  if AbsOld < CFloor then AbsOld := CFloor;
+  Q := AbsNew / AbsOld;
+  if Q <= 1 then exit;
+  LogQ := Ln(Q);
+
+  K := FGridSpec.BasisOrder;
+  N := Length(FHead.Coeffs);
+  Lo := Max(0, I - K);
+  Hi := Min(N - 1, I + K);
+
+  Rule := ResolveShareMode({IsHighClip=}False, LayerClipRate);
+
+  SetLength(ShareWeights, Hi - Lo + 1);
+  ShareTotal := 0;
+  for J := Lo to Hi do
+  begin
+    if J = I then
+    begin
+      ShareWeights[J - Lo] := 0;
+      Continue;
+    end;
+    case Rule of
+      ksrProportional:        ShareJ := Max(Abs(FHead.Coeffs[J]), CFloor);
+      ksrInverseProportional: ShareJ := 1 / Max(Abs(FHead.Coeffs[J]), CFloor);
+    else                       ShareJ := Max(Abs(FHead.Coeffs[J]), CFloor);
+    end;
+    ShareWeights[J - Lo] := ShareJ;
+    ShareTotal := ShareTotal + ShareJ;
+  end;
+
+  if ShareTotal <= 0 then
+  begin
+    Result := True;
+    exit;
+  end;
+
+  // f_j = (1/Q)^{s_j/ShareTotal} = Exp(-s_j * LogQ / ShareTotal);
+  // product of factors is exactly 1/Q.
+  for J := Lo to Hi do
+  begin
+    if J = I then Continue;
+    if ShareWeights[J - Lo] <= 0 then Continue;
+    Factor := Exp(-(ShareWeights[J - Lo] / ShareTotal) * LogQ);
     FHead.Coeffs[J] := FHead.Coeffs[J] * Factor;
   end;
 
