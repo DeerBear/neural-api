@@ -352,16 +352,45 @@ begin
 end;
 
 procedure TNNetKANNormaliser.GaugeRenormalise;
+// Spec 5.3: enforce per-head geometric mean of |c_j| = 1 by dividing every
+// coefficient by G := exp(mean_j(log|c_j|)). A pure gauge transformation:
+// w_ij = phi(s)/sum(phi) is invariant under uniform multiplicative rescale,
+// so the forward attention output is mathematically unchanged (5.3.4).
+// Computed in log-space throughout to dodge Pi|c_j| under/overflow (5.3.3).
+var
+  I, N: integer;
+  AbsC, LogSum, InvG: TNeuralFloat;
 begin
-  // TODO: log-space mean of |c_j|, divide all coefficients by exp(mean).
-  raise EKANBadState.Create('TNNetKANNormaliser.GaugeRenormalise: not implemented');
+  N := Length(FHead.Coeffs);
+  if N = 0 then exit;
+  LogSum := 0;
+  for I := 0 to N - 1 do
+  begin
+    AbsC := Abs(FHead.Coeffs[I]);
+    // floor zero magnitudes so Ln(0) = -Infinity can't poison the mean;
+    // for the cold-started exp(knot/2) fit no |c_j| ever reaches this.
+    if AbsC < 1e-30 then AbsC := 1e-30;
+    LogSum := LogSum + Ln(AbsC);
+  end;
+  InvG := Exp(-LogSum / N);   // 1/G as a single Exp; signs preserved (GM-3).
+  for I := 0 to N - 1 do
+    FHead.Coeffs[I] := FHead.Coeffs[I] * InvG;
 end;
 
 procedure TNNetKANNormaliser.CheckHandover;
+// Spec 6.3 / 6.6: one-way transition ksSoftmaxActive -> ksKANActive once
+// KL_ema has stayed below epsilon_KL for at least N_confirm consecutive
+// passes. The counter is maintained here against the most recent KLEMA
+// snapshot; KLEMA itself is refreshed by the NLMS phases each pass.
+// Once a head is ksKANActive there is no reversion (spec 6.6).
 begin
-  // TODO: if KLEMA < EpsilonKL for >= NConfirm consecutive passes,
-  // atomically flip Status := ksKANActive (spec §6.3).
-  raise EKANBadState.Create('TNNetKANNormaliser.CheckHandover: not implemented');
+  if FHead.Status <> ksSoftmaxActive then exit;
+  if FHead.KLEMA < FEpsilonKL then
+    Inc(FHead.ConsecutiveLowPasses)
+  else
+    FHead.ConsecutiveLowPasses := 0;
+  if FHead.ConsecutiveLowPasses >= FNConfirm then
+    FHead.Status := ksKANActive;
 end;
 
 procedure TNNetKANNormaliser.ColdStartHead;
