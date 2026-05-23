@@ -128,6 +128,8 @@ type
 
     // --- Mechanism #1 helpers (spec §5.2) ---
     function  WindowGM(const I: integer): TNeuralFloat;
+    function  ResolveShareMode(const IsHighClip: boolean;
+                               const LayerClipRate: TNeuralFloat): TKANShareRule;
 
     procedure Mechanism1Sweep;
     procedure GaugeRenormalise;
@@ -465,6 +467,35 @@ begin
     LogSum := LogSum + Ln(AbsC);
   end;
   Result := Exp(LogSum / (Hi - Lo + 1));
+end;
+
+function TNNetKANNormaliser.ResolveShareMode(const IsHighClip: boolean;
+                                              const LayerClipRate: TNeuralFloat): TKANShareRule;
+// Spec 5.2.5: select the share rule for one clip-or-lift event.
+//   Configured non-auto    -> return as-is.
+//   Auto + clip_rate < tau_calm        -> Mode A (Proportional for both halves).
+//   Auto + clip_rate > tau_stressed    -> Mode C (HighClip=Inverse, LowLift=Prop).
+//   Auto + in hysteresis band          -> default to Mode C (the safe,
+//     always-stable mode per 5.2.5). The spec's literal phrasing is
+//     "keep current mode" which strictly requires a small persistent
+//     state across calls; v1 defers that refinement -- Mode C is safe
+//     in every regime and matches the "Stable; converges fast" note.
+// Mode D (Prop high + Inv low) is structurally unreachable here.
+var
+  Configured: TKANShareRule;
+begin
+  if IsHighClip then Configured := FHighClipShare
+  else               Configured := FLowLiftShare;
+
+  if Configured <> ksrAuto then
+    Exit(Configured);
+
+  if LayerClipRate < FTauCalm then
+    Exit(ksrProportional);                 // Mode A (both halves Proportional)
+
+  // Mode C (clip_rate > tau_stressed OR in hysteresis band)
+  if IsHighClip then Exit(ksrInverseProportional)
+  else               Exit(ksrProportional);
 end;
 
 procedure TNNetKANNormaliser.Mechanism1Sweep;
