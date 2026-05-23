@@ -34,8 +34,12 @@ TKANAttentionLayerInfo (neuralkanattention unit).
 Mechanism specification:    docs/kan_attention_spec.md §5, §6, §7
 Implementation decisions:   docs/kan_implementation_pascal.md §5
 
-v1 status: SKELETON. The §7 pipeline body is a stub raising EKANBadState;
-mode-safety guards (Backpropagate, EnterInferenceMode) are real.
+v1 status: §7 pipeline body, both NLMS phases, gauge, mechanism #1
+cascade, KL/handover, basis evaluation, and the chain-decorator fallback
+are all implemented. Stubs remaining (non-blocking for first run):
+SaveDataToString / LoadDataFromString / SaveStructureToString. Layer-info
+backref (for clip-rate plumbing) and ZeroOutputForInactive are deferred
+to a v2 pass that also lands DoSquaring; see Compute's header comment.
 *)
 
 
@@ -239,36 +243,118 @@ begin
 end;
 
 procedure TNNetKANNormaliser.Compute;
+// Spec 7: per-inference pipeline body. Per-head; the layer-level steps
+// (squaring trigger, concat, output projection) live elsewhere -- the layer
+// info object (TKANAttentionLayerInfo) and the downstream chain layers
+// respectively. This proc owns steps 2-10 of spec 7 for a single head.
+//
+// Step 1 (compute scores) was done by the TNNetDotProducts upstream of the
+// softmax; we read its output via FPrevLayer.FPrevLayer.Output. Step 5
+// (attended = w * V) is done by the TNNetDotProducts downstream; we just
+// populate FOutput with the chosen weights matrix.
+//
+// Per-row interleaving rationale: spec 5.5.3's "row snapshot" lives in
+// instance fields (FPhiRow / FRowSum / FWKANRow) and must be valid for the
+// per-row NLMS. We therefore evaluate -> compute weights -> write output row
+// -> accumulate KL row contribution -> per-row NLMS, then move to the next
+// row. The next row's EvaluateSplineRow recomputes the snapshot from the
+// now-updated coefficients, matching spec 5.5.3's frozen-per-row,
+// evolved-across-rows semantics.
+//
+// v1 limitations (acceptable; documented for v2 pickup):
+//   - No backref from normaliser to TKANAttentionLayerInfo (no circular dep
+//     declared). The orchestrator therefore passes 0 as LayerClipRate to
+//     Mechanism1Sweep, which makes ResolveShareMode always pick Mode A
+//     (proportional/proportional, gentle preserve-shape). Per-head clip
+//     rates also aren't reported back to the layer's squaring EMA -- fine in
+//     v1 because DoSquaring is also stubbed.
+//   - ZeroOutputForInactive isn't invoked; all heads are assumed active.
+//     With no squaring in v1, ActiveHeads = HMax always, so every head is
+//     valid. When squaring lands the orchestrator gains an "am I beyond
+//     ActiveHeads" check that calls ZeroOutputForInactive and skips the
+//     rest of the pipeline.
+var
+  PreScores: TNNetVolume;
+  RowIdx, RowLen, NumRows, J, Depth: integer;
+  KLPassSum, KLPass: TNeuralFloat;
+  LayerClipRate: TNeuralFloat;
 begin
   if (not FInferenceMode) or (not FKANEnabled) then
   begin
-    // Fallback: pure identity passthrough. FPrevLayer is the softmax
-    // (placed by AddKANSelfAttention), FPrevLayer.FOutput already holds
-    // the row-normalised attention weights. inherited Compute (from
-    // TNNetIdentity) copies that into FOutput. No KAN bookkeeping, no
-    // per-head state mutation, no extra cost.
+    // Fallback: pure identity passthrough. inherited Compute (TNNetIdentity)
+    // copies FPrevLayer.FOutput (the softmax) into FOutput. No KAN bookkeeping.
     inherited Compute;
     exit;
   end;
 
-  // KAN mode: read pre-softmax scores from FPrevLayer.FPrevLayer.FOutput
-  // (the chain layer immediately before the softmax) and run §7
-  // pipeline. The softmax's output (FPrevLayer.FOutput) is available
-  // for the KL comparison (spec §6.1) at no extra forward cost.
-  //
-  // TODO: §7 pipeline.
-  //   for each row in pre-softmax scores:
-  //     EvaluateSplineRow      (write FPhiRow, FRowSum from coefficients)
-  //     ComputeWeightsRow      (FWKANRow := φ / Σ φ;
-  //                             FWSoftmaxRow := already in FPrevLayer.FOutput)
-  //     write selected weights to FOutput
-  //     ComputeKLRow           (uses FPrevLayer.FOutput directly)
-  //     NLMS (Phase M or Phase D depending on Status)
-  //     Mechanism1Sweep
-  //     GaugeRenormalise
-  //   if Status = SoftmaxActive: CheckHandover
-  //   if not active head: ZeroOutputForInactive
-  raise EKANBadState.Create('TNNetKANNormaliser.Compute: §7 pipeline not implemented');
+  // Pre-softmax scores from the layer immediately upstream of the softmax
+  // (the chain shape AddKANSelfAttention builds is ... -> ReLUL -> Softmax
+  // -> KANNormaliser). Same shape and indexing as the softmax output:
+  // Depth = number of rows, SizeX*SizeY = per-row column count.
+  PreScores := FPrevLayer.FPrevLayer.Output;
+  NumRows := PreScores.Depth;
+  RowLen := PreScores.SizeX * PreScores.SizeY;
+  if (NumRows = 0) or (RowLen = 0) then exit;
+
+  Depth := FOutput.Depth;
+  KLPassSum := 0;
+
+  for RowIdx := 0 to NumRows - 1 do
+  begin
+    // Steps 2-3 (spec 7): spline eval + candidate weights for this row.
+    EvaluateSplineRow(PreScores, RowIdx, RowLen);
+    ComputeWeightsRow(PreScores, RowIdx, RowLen);
+
+    // Step 4: write selected forward-path weights into FOutput[*, RowIdx]
+    // using the same Depth-fastest indexing the inputs and helpers use.
+    if FHead.Status = ksSoftmaxActive then
+    begin
+      for J := 0 to RowLen - 1 do
+        FOutput.Raw[J * Depth + RowIdx] := FWSoftmaxRow[J];
+    end
+    else
+    begin
+      for J := 0 to RowLen - 1 do
+        FOutput.Raw[J * Depth + RowIdx] := FWKANRow[J];
+    end;
+
+    // Step 6 (per-row contribution): accumulate KL while both candidate rows
+    // are populated. KL is only meaningful pre-takeover; once handed over
+    // FSkipRedundantSoftmax suppresses the softmax candidate (FWSoftmaxRow
+    // contents are stale) and the check is skipped.
+    if FHead.Status = ksSoftmaxActive then
+      KLPassSum := KLPassSum + ComputeKLRow(RowLen);
+
+    // Step 7: NLMS update for this row. Phase per current status. Mutates
+    // coefficients; next row's EvaluateSplineRow picks up the new state.
+    if FHead.Status = ksSoftmaxActive then
+      NLMSPhaseM(PreScores, RowIdx, RowLen)
+    else
+      NLMSPhaseD(PreScores, RowIdx, RowLen);
+  end;
+
+  // Step 6 (per-pass completion): EMA update from this pass's mean row KL.
+  // First update after cold-start replaces the Infinity sentinel rather than
+  // blending (Inf*0.99 + finite*0.01 stays Inf), so the EMA actually moves.
+  if FHead.Status = ksSoftmaxActive then
+  begin
+    KLPass := KLPassSum / NumRows;
+    if FHead.KLEMA = Infinity then
+      FHead.KLEMA := KLPass
+    else
+      FHead.KLEMA := (1 - FLambdaKL) * FHead.KLEMA + FLambdaKL * KLPass;
+  end;
+
+  // Steps 8-9: mechanism #1 cascade + GM=1 gauge renormalisation. Order
+  // matters per spec 7.1: rebalance operates on the pre-renormalised state
+  // (where window products are meaningful), then gauge resets the scale.
+  LayerClipRate := 0;   // v1 placeholder; see header comment.
+  Mechanism1Sweep(LayerClipRate);
+  GaugeRenormalise;
+
+  // Step 10: handover check (internally no-ops if already handed over or if
+  // the KLEMA / counter conditions aren't met). One-way per spec 6.6.
+  CheckHandover;
 end;
 
 procedure TNNetKANNormaliser.Backpropagate;
