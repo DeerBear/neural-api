@@ -397,10 +397,30 @@ begin
 end;
 
 function TNNetKANNormaliser.ComputeKLRow(const RowLen: integer): TNeuralFloat;
+// Spec 6.1: KL(softmax || KAN) over the row, in nats. Drives the EMA in
+// 6.2 / 6.3 that triggers SoftmaxActive -> KANActive graduation.
+//   KL := sum_j p_j * log( p_j / q_j )
+// where p = FWSoftmaxRow, q = FWKANRow (both populated by the most recent
+// ComputeWeightsRow). Terms with p_j = 0 contribute 0 (the standard
+// 0*log(0/q) := 0 convention). q_j is floored to a tiny epsilon so an
+// unexpectedly-zero KAN weight cannot blow KL up to +Infinity and derail
+// the EMA -- the floor is well below any threshold the rest of the spec
+// relies on (epsilon_KL defaults to 0.01 nats, 6.3).
+var
+  J: integer;
+  P, Q: TNeuralFloat;
+const
+  QFloor = 1e-30;
 begin
-  // TODO: KL(softmax || KAN) over RowLen positions, in nats.
   Result := 0;
-  raise EKANBadState.Create('TNNetKANNormaliser.ComputeKLRow: not implemented');
+  for J := 0 to RowLen - 1 do
+  begin
+    P := FWSoftmaxRow[J];
+    if P <= 0 then Continue;
+    Q := FWKANRow[J];
+    if Q < QFloor then Q := QFloor;
+    Result := Result + P * Ln(P / Q);
+  end;
 end;
 
 procedure TNNetKANNormaliser.NLMSPhaseM(const ScoresRow: TNNetVolume;
