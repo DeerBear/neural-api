@@ -342,12 +342,58 @@ end;
 
 procedure TNNetKANNormaliser.ComputeWeightsRow(const ScoresRow: TNNetVolume;
                                                  const RowIdx, RowLen: integer);
+// Spec 5.5.1: derive the two candidate weight rows.
+//   FWKANRow   := FPhiRow / FRowSum         (populated by EvaluateSplineRow)
+//   FWSoftmaxRow := numerically-stable row softmax of ScoresRow at RowIdx
+// The softmax candidate is skipped when FSkipRedundantSoftmax is true AND
+// the head has taken over (spec 11.8) -- the row-KL is then meaningless
+// and the caller is responsible for not invoking ComputeKLRow.
+// Same Depth-stride indexing as EvaluateSplineRow.
+var
+  J, D: integer;
+  S, MaxScore, Sum: TNeuralFloat;
 begin
-  // TODO:
-  //   FWKANRow[j] := FPhiRow[j] / FRowSum
-  //   if not (FSkipRedundantSoftmax and Status=KANActive):
-  //     FWSoftmaxRow := row_softmax(ScoresRow[RowIdx])
-  raise EKANBadState.Create('TNNetKANNormaliser.ComputeWeightsRow: not implemented');
+  if Length(FWKANRow) < RowLen then SetLength(FWKANRow, RowLen);
+  if Length(FWSoftmaxRow) < RowLen then SetLength(FWSoftmaxRow, RowLen);
+
+  // KAN candidate: row-normalise phi.
+  if FRowSum > 0 then
+  begin
+    for J := 0 to RowLen - 1 do
+      FWKANRow[J] := FPhiRow[J] / FRowSum;
+  end
+  else
+  begin
+    // Pathological: every phi on this row was zero. Yield a uniform row so
+    // downstream KL / NLMS don't divide by zero; the next pass's NLMS will
+    // pull coefficients back into range.
+    for J := 0 to RowLen - 1 do
+      FWKANRow[J] := 0;
+  end;
+
+  if FSkipRedundantSoftmax and (FHead.Status = ksKANActive) then exit;
+
+  // Softmax candidate: subtract row max for numerical stability, then exp
+  // and normalise.
+  D := ScoresRow.Depth;
+  MaxScore := ScoresRow.Raw[RowIdx];        // J=0 contribution
+  for J := 1 to RowLen - 1 do
+  begin
+    S := ScoresRow.Raw[J * D + RowIdx];
+    if S > MaxScore then MaxScore := S;
+  end;
+  Sum := 0;
+  for J := 0 to RowLen - 1 do
+  begin
+    FWSoftmaxRow[J] := Exp(ScoresRow.Raw[J * D + RowIdx] - MaxScore);
+    Sum := Sum + FWSoftmaxRow[J];
+  end;
+  if Sum > 0 then
+  begin
+    Sum := 1 / Sum;
+    for J := 0 to RowLen - 1 do
+      FWSoftmaxRow[J] := FWSoftmaxRow[J] * Sum;
+  end;
 end;
 
 function TNNetKANNormaliser.ComputeKLRow(const RowLen: integer): TNeuralFloat;
