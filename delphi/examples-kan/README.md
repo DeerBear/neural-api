@@ -27,9 +27,9 @@ What's wired up already:
 
 ## Contents
 
-| Path | Source | Notes |
+| Path | Pairs with | Notes |
 |---|---|---|
-| `SimpleNLP/SimpleTransformer.dpr` | mirrors `examples/SimpleNLP/SimpleTransformer.dpr` | TinyStories character-level transformer; the only example in the tree that has attention layers to KAN-ify. |
+| `SimpleNLP/SimpleTransformer1M.dpr` | `examples/SimpleNLP/SimpleTransformer1M.dpr` (softmax) | TinyStories character-level transformer, EmbeddingDim 256 → ~1.4M params. Param-matched A/B between KAN and softmax attention (KAN adds ~2K spline coefficients, 0.15% overhead). The only example with attention layers to KAN-ify; smaller siblings (`SimpleTransformer.dpr` at 575K) are kept as softmax-only in the base tree. |
 
 Other examples (image classifiers, MLP toys, classifier-only convolutional
 nets) have no self-attention path and so don't have a KAN variant. If/when a

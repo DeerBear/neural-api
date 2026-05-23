@@ -1,26 +1,18 @@
-program SimpleTransformer;
+program SimpleTransformer1M;
 
 {$APPTYPE CONSOLE}
 (*
-KAN-attention variant of the SimpleTransformer NLP example.
+Softmax baseline at ~1.4M parameters -- the larger sibling of
+SimpleTransformer.dpr (~575K). Identical architecture except the
+seq-mixing TNNetConvolution emits 256 channels instead of 128, which
+roughly doubles the per-block cost. 256 / 16 heads = 16 dims per
+head; divides cleanly. Total params ~1.39M, almost all in the two
+transformer blocks (~525K each).
 
-Identical to delphi/examples/SimpleNLP/SimpleTransformer.dpr except:
-  * THistoricalNets -> TKANNet  (the KAN-aware network class).
-  * The transformer block is built by hand instead of via
-    AddTransformerBlockCAI, so that the per-head softmax inside the
-    attention sub-chain can be replaced by TNNetKANNormaliser via
-    TKANNet.AddKANSelfAttention. The rest of the block (residual sum,
-    FFN, second residual, activations) mirrors the layout of
-    TNNet.AddTransformerBlockCAI byte-for-byte.
-  * FNN.LockToInference is called after FitLoading completes, so the
-    one post-training GenerateStringFromChars run engages the KAN
-    attention path; everything before that (training + per-epoch
-    sampling) runs through the bit-identical softmax fallback.
-
-Runs only once the KAN implementation stubs have all been filled --
-in v1 several TNNetKANNormaliser pipeline methods (NLMSPhaseM/D,
-the Compute orchestrator, the AddKANSelfAttention builder body) are
-still stubs that raise EKANBadState.
+Paired with delphi/examples-kan/SimpleNLP/SimpleTransformer1M.dpr
+(same architecture, KAN-attention via TKANNet + AddKANSelfAttention)
+for a single-architectural-variable A/B comparison at matched
+parameter count.
 
 Copyright (C) 2023 Joao Paulo Schwarz Schuler
 
@@ -28,7 +20,17 @@ This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation; either version 2 of the License, or
 any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along
+with this program; if not, write to the Free Software Foundation, Inc.,
+51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 *)
+
 
 
 uses
@@ -38,7 +40,7 @@ uses
   neuralfit in '..\..\neural\neuralfit.pas',
   neuraldatasets in '..\..\neural\neuraldatasets.pas',
   neuralthread in '..\..\neural\neuralthread.pas',
-  CustApp in '..\..\examples\CustApp.pas',
+  CustApp in '..\CustApp.pas',
   Math,
   neuralab in '..\..\neural\neuralab.pas',
   neuralabfun in '..\..\neural\neuralabfun.pas',
@@ -46,11 +48,7 @@ uses
   neuralbyteprediction in '..\..\neural\neuralbyteprediction.pas',
   neuralcache in '..\..\neural\neuralcache.pas',
   neuralgeneric in '..\..\neural\neuralgeneric.pas',
-  neuralsimd in '..\..\neural\neuralsimd.pas',
-  neuralkantypes in '..\..\neural\neuralkantypes.pas',
-  neuralkanbasis in '..\..\neural\neuralkanbasis.pas',
-  neuralkannormaliser in '..\..\neural\neuralkannormaliser.pas',
-  neuralkanattention in '..\..\neural\neuralkanattention.pas';
+  neuralsimd in '..\..\neural\neuralsimd.pas';
 
 const
   csContextLen = 81;
@@ -66,7 +64,7 @@ type
   protected
     FDataset: TStringList;
     FDatasetSize: integer;
-    FNN: TKANNet;
+    FNN: THistoricalNets;
     NFit: TNeuralDataLoadingFit;
     FSampler: TNNetSamplerBase;
     FMaxPredictCharPos: integer;
@@ -104,12 +102,10 @@ type
   var
     W: TNNetLayer;
     I: integer;
-    PrevLayer, Attended, AttendedPlusPrev: TNNetLayer;
-    EmbeddingDim: integer;
   begin
     FDataset := TStringList.Create();
     LoadDataset();
-    FNN := TKANNet.Create();
+    FNN := THistoricalNets.Create();
     NFit := TNeuralDataLoadingFit.Create();
     FMaxPredictCharPos := 81;
     FSampler := TNNetSamplerTopP.Create(0.4);
@@ -117,26 +113,12 @@ type
       TNNetInput.Create(csContextLen, 1, csVocabSize),
       TNNetAddPositionalEmbedding.Create(10000),
       TNNetConvolutionReLU.Create(32,1,0,1,0),
-      TNNetConvolution.Create(128,13,0,13,0)
+      TNNetConvolution.Create(256,13,0,13,0)
     ]);
 
-    // Two KAN-attention transformer blocks. Layout mirrors
-    // TNNet.AddTransformerBlockCAI(Heads=16, IntermediateDim=512, pActFn=
-    // TNNetSignedSquareRoot1) but swaps the per-head softmax in the
-    // attention sub-chain for TNNetKANNormaliser via AddKANSelfAttention.
     for I := 1 to 2 do
     begin
-      PrevLayer := FNN.GetLastLayer();
-      EmbeddingDim := PrevLayer.Output.Depth;
-      Attended := FNN.AddKANSelfAttention({InitialHeads=}16);
-      AttendedPlusPrev := FNN.AddLayer( TNNetSum.Create([Attended, PrevLayer]) );
-      AttendedPlusPrev := FNN.AddLayer( TNNetSignedSquareRoot1.Create() );
-      FNN.AddLayer( TNNetPointwiseConvReLU.Create(512, 1) );
-      FNN.AddLayer( TNNetSignedSquareRoot1.Create() );
-      FNN.AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim, 1) );
-      FNN.AddLayer( TNNetSignedSquareRoot1.Create() );
-      FNN.AddLayer( TNNetSum.Create([FNN.GetLastLayer(), AttendedPlusPrev]) );
-      FNN.AddLayer( TNNetSignedSquareRoot1.Create() );
+      FNN.AddTransformerBlockCAI(16, 512);
     end;
 
     FNN.AddLayer([
@@ -171,15 +153,6 @@ type
       @GetTrainingPair, @GetValidationPair, @GetTestPair
     );
     FNN.DebugWeights();
-
-    // Training is complete: engage the KAN attention path. After this
-    // call, every TNNetKANNormaliser in FNN switches from passthrough to
-    // its B-spline normaliser. The final OnAfterEpoch below therefore
-    // generates with KAN attention active. LockToInference is one-way --
-    // no further training is permitted on FNN.
-    FNN.LockToInference;
-    WriteLn('--- KAN attention engaged; post-training generation: ---');
-
     OnAfterEpoch(Self);
     FSampler.Free;
     NFit.Free;
@@ -264,7 +237,7 @@ var
   Application: TTestFitLoading;
 begin
   Application := TTestFitLoading.Create(nil);
-  Application.Title:='Nano Convolutional+KAN-Attention NLP Trained from File';
+  Application.Title:='SimpleTransformer1M softmax baseline (TinyStories)';
   Application.Run;
   Application.Free;
 end.
