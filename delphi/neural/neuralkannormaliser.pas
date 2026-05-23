@@ -125,6 +125,10 @@ type
                          const RowIdx, RowLen: integer);
     procedure NLMSPhaseD(const ScoresRow: TNNetVolume;
                          const RowIdx, RowLen: integer);
+
+    // --- Mechanism #1 helpers (spec §5.2) ---
+    function  WindowGM(const I: integer): TNeuralFloat;
+
     procedure Mechanism1Sweep;
     procedure GaugeRenormalise;
     procedure CheckHandover;
@@ -436,6 +440,31 @@ begin
   // TODO: per-score NLMS toward sharpened target derived from FRowSum
   // and FWKANRow snapshot; α-power renormalisation (spec §5.5.3).
   raise EKANBadState.Create('TNNetKANNormaliser.NLMSPhaseD: not implemented');
+end;
+
+function TNNetKANNormaliser.WindowGM(const I: integer): TNeuralFloat;
+// Spec 5.2.2: geometric mean of |c_j| over c_i's 2k+1 window, clamped at
+// array boundaries. Log-space throughout for numerical safety. No epsilon
+// floor is strictly required (the low-lift rule 5.2.4 keeps |c_j| bounded
+// away from zero) but we defend against the cold-start edge by flooring
+// to 1e-30 anyway.
+var
+  J, Lo, Hi, K: integer;
+  AbsC, LogSum: TNeuralFloat;
+const
+  CFloor = 1e-30;
+begin
+  K := FGridSpec.BasisOrder;             // cubic -> radius 3 -> 2k+1 = 7
+  Lo := Max(0, I - K);
+  Hi := Min(Length(FHead.Coeffs) - 1, I + K);
+  LogSum := 0;
+  for J := Lo to Hi do
+  begin
+    AbsC := Abs(FHead.Coeffs[J]);
+    if AbsC < CFloor then AbsC := CFloor;
+    LogSum := LogSum + Ln(AbsC);
+  end;
+  Result := Exp(LogSum / (Hi - Lo + 1));
 end;
 
 procedure TNNetKANNormaliser.Mechanism1Sweep;
