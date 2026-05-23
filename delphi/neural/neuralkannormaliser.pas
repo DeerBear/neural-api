@@ -134,8 +134,9 @@ type
                          const LayerClipRate: TNeuralFloat): boolean;
     function  LowLiftAt(const I: integer; const G: TNeuralFloat;
                         const LayerClipRate: TNeuralFloat): boolean;
+    function  SweepOnce(const LayerClipRate: TNeuralFloat): integer;
 
-    procedure Mechanism1Sweep;
+    procedure Mechanism1Sweep(const LayerClipRate: TNeuralFloat);
     procedure GaugeRenormalise;
     procedure CheckHandover;
     procedure ColdStartHead;
@@ -661,11 +662,49 @@ begin
   Result := True;
 end;
 
-procedure TNNetKANNormaliser.Mechanism1Sweep;
+function TNNetKANNormaliser.SweepOnce(const LayerClipRate: TNeuralFloat): integer;
+// Spec 5.2.6 inner loop: one pass over all coefficients. For each c_i,
+// recompute its window's g and try high-clip (5.2.3); failing that, try
+// low-lift (5.2.4). High-clip and low-lift are mutually exclusive on the
+// value of |c_i| (one requires above 3*g, the other below g/2), so at
+// most one fires per coefficient per pass. Returns the count of fires.
+var
+  I, N: integer;
+  G: TNeuralFloat;
 begin
-  // TODO: cascade to fixed point with high-clip + low-lift + share-rule
-  // redistribution (spec §5.2). Increment FCascadeCapHits if max_iter reached.
-  raise EKANBadState.Create('TNNetKANNormaliser.Mechanism1Sweep: not implemented');
+  Result := 0;
+  N := Length(FHead.Coeffs);
+  for I := 0 to N - 1 do
+  begin
+    G := WindowGM(I);
+    if HighClipAt(I, G, LayerClipRate) then
+      Inc(Result)
+    else if LowLiftAt(I, G, LayerClipRate) then
+      Inc(Result);
+  end;
+end;
+
+procedure TNNetKANNormaliser.Mechanism1Sweep(const LayerClipRate: TNeuralFloat);
+// Spec 5.2.6: cascade the per-coefficient sweep to a fixed point with a
+// hard safety cap (FCascadeMaxIter, default 16). If the cap is reached
+// without convergence the per-head FCascadeCapHits counter is incremented
+// (5.2.6 "Behaviour at the cap" note). Invariant M1-1 (per-window product
+// preservation) is satisfied throughout regardless of cap-hit, because
+// every individual event in SweepOnce preserves products by construction;
+// only M1-3 (bounded coefficients) may be violated for the capped pass,
+// and the next pass's sweep continues the relaxation.
+var
+  Iter, Fired, Cap: integer;
+begin
+  Cap := FCascadeMaxIter;
+  if Cap < 1 then Cap := 16;
+  for Iter := 1 to Cap do
+  begin
+    Fired := SweepOnce(LayerClipRate);
+    if Fired = 0 then exit;
+  end;
+  // Cap reached without convergence; record it (5.2.6 cap behaviour).
+  Inc(FCascadeCapHits);
 end;
 
 procedure TNNetKANNormaliser.GaugeRenormalise;
