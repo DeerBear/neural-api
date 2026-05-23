@@ -436,9 +436,58 @@ end;
 
 procedure TNNetKANNormaliser.NLMSPhaseM(const ScoresRow: TNNetVolume;
                                          const RowIdx, RowLen: integer);
+// Spec 5.5.2: Phase M NLMS, per score, in psi-space. Acts only on the k+1
+// coefficients with non-zero basis activation at s.
+//   target := exp(s/2)
+//   y_hat  := psi(s) = sum_m c_m * B_m(s)        (linear sum; coeffs ARE psi's)
+//   err    := target - y_hat
+//   denom  := sum_m B_m(s)^2 + delta
+//   c_m    := c_m + eta * B_m(s) * err / denom
+//
+// Target reconciliation between specs 5.1 and 5.5.2: 5.5.2's pseudocode
+// reads "target := exp(s)" with y_hat = sum c*B. 5.1 fixes the
+// parametrisation as phi = psi^2 with stored coefficients being psi's, and
+// initialises psi via LS fit to exp(s/2) so phi approximates exp(s).
+// Carrying that through 5.5.2 means the linear-in-c target must be exp(s/2),
+// not exp(s): the post-fit phi = psi^2 = exp(s) then makes phi/sum(phi) =
+// exp(s)/sum(exp(s)) = softmax(s), matching 5.5.2's stated outcome. The
+// "target := exp(s)" line in 5.5.2's pseudocode is a notational artefact of
+// treating phi as linear in c; the actual quantity linear in c is psi, and
+// its target is exp(s/2). This implementation follows the 5.1-consistent
+// reading. (Spec note: 5.5.2 should be tightened to say psi / exp(s/2) so
+// the two sections align.)
+//
+// Same Depth-stride indexing as EvaluateSplineRow.
+var
+  J, FirstIdx, M, KnotN, D: integer;
+  S, Psi, Target, Err, Denom, Step: TNeuralFloat;
+  BasisVals: array[0..3] of TNeuralFloat;
 begin
-  // TODO: per-score NLMS toward exp(s), in psi-space (spec §5.5.2).
-  raise EKANBadState.Create('TNNetKANNormaliser.NLMSPhaseM: not implemented');
+  KnotN := Length(FHead.Coeffs);
+  D := ScoresRow.Depth;
+  for J := 0 to RowLen - 1 do
+  begin
+    S := ScoresRow.Raw[J * D + RowIdx];
+    FBasis.Evaluate(S, FirstIdx, BasisVals);
+    Psi := 0;
+    Denom := FNlmsDelta;
+    for M := 0 to 3 do
+    begin
+      if (FirstIdx + M >= 0) and (FirstIdx + M < KnotN) then
+      begin
+        Psi := Psi + FHead.Coeffs[FirstIdx + M] * BasisVals[M];
+        Denom := Denom + BasisVals[M] * BasisVals[M];
+      end;
+    end;
+    Target := Exp(0.5 * S);
+    Err := Target - Psi;
+    Step := FNlmsEta * Err / Denom;
+    for M := 0 to 3 do
+    begin
+      if (FirstIdx + M >= 0) and (FirstIdx + M < KnotN) then
+        FHead.Coeffs[FirstIdx + M] := FHead.Coeffs[FirstIdx + M] + Step * BasisVals[M];
+    end;
+  end;
 end;
 
 procedure TNNetKANNormaliser.NLMSPhaseD(const ScoresRow: TNNetVolume;
