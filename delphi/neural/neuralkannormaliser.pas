@@ -543,10 +543,24 @@ procedure TNNetKANNormaliser.NLMSPhaseM(const ScoresRow: TNNetVolume;
 // reading. (Spec note: 5.5.2 should be tightened to say psi / exp(s/2) so
 // the two sections align.)
 //
+// Out-of-grid short-circuit: scores outside the basis grid have zero basis
+// support (FBasis.Evaluate returns zero BasisVals). Without a guard the
+// per-score NLMS would still compute Target = Exp(0.5 * S), which for the
+// chain's ReLUL clamp range (+/-500) can overflow Single precision to +Inf;
+// then Step = Inf, and the coefficient update Step * BasisVals[M] hits
+// Inf * 0 = NaN, permanently poisoning the coefficient. The no-support
+// short-circuit skips the entire update for any score with no basis
+// activation, which is mathematically a no-op anyway. A v1.1 hardening
+// would apply your "rescale and spread" idea: subtract a fixed grid-tied
+// constant from S before Exp when S approaches the overflow threshold,
+// letting the gauge absorb the resulting scale (phi/sum(phi) is gauge-
+// invariant). The short-circuit form is correct for the default grid;
+// the rescale form is robust against pathologically wide custom grids.
+//
 // Same Depth-stride indexing as EvaluateSplineRow.
 var
   J, FirstIdx, M, KnotN, D: integer;
-  S, Psi, Target, Err, Denom, Step: TNeuralFloat;
+  S, Psi, Target, Err, Denom, BasisSqSum, Step: TNeuralFloat;
   BasisVals: array[0..3] of TNeuralFloat;
 begin
   KnotN := Length(FHead.Coeffs);
@@ -556,15 +570,20 @@ begin
     S := ScoresRow.Raw[J * D + RowIdx];
     FBasis.Evaluate(S, FirstIdx, BasisVals);
     Psi := 0;
-    Denom := FNlmsDelta;
+    BasisSqSum := 0;
     for M := 0 to 3 do
     begin
       if (FirstIdx + M >= 0) and (FirstIdx + M < KnotN) then
       begin
         Psi := Psi + FHead.Coeffs[FirstIdx + M] * BasisVals[M];
-        Denom := Denom + BasisVals[M] * BasisVals[M];
+        BasisSqSum := BasisSqSum + BasisVals[M] * BasisVals[M];
       end;
     end;
+    // No basis support at this score => coefficient update would be a no-op.
+    // Skip explicitly to avoid the Inf * 0 = NaN trap if Exp(0.5*S)
+    // overflows for far-out-of-grid scores (header comment).
+    if BasisSqSum <= 0 then Continue;
+    Denom := BasisSqSum + FNlmsDelta;
     Target := Exp(0.5 * S);
     Err := Target - Psi;
     Step := FNlmsEta * Err / Denom;
@@ -609,7 +628,7 @@ procedure TNNetKANNormaliser.NLMSPhaseD(const ScoresRow: TNNetVolume;
 // Same Depth-stride indexing as EvaluateSplineRow.
 var
   J, FirstIdx, M, KnotN, D: integer;
-  S, SumSharp, Err, Denom, Step: TNeuralFloat;
+  S, SumSharp, Err, Denom, BasisSqSum, Step: TNeuralFloat;
   BasisVals: array[0..3] of TNeuralFloat;
 begin
   if Length(FWSharpRow) < RowLen then SetLength(FWSharpRow, RowLen);
@@ -643,12 +662,17 @@ begin
   begin
     S := ScoresRow.Raw[J * D + RowIdx];
     FBasis.Evaluate(S, FirstIdx, BasisVals);
-    Denom := FNlmsDelta;
+    BasisSqSum := 0;
     for M := 0 to 3 do
     begin
       if (FirstIdx + M >= 0) and (FirstIdx + M < KnotN) then
-        Denom := Denom + BasisVals[M] * BasisVals[M];
+        BasisSqSum := BasisSqSum + BasisVals[M] * BasisVals[M];
     end;
+    // No basis support at this score => update is a no-op. Skip for
+    // consistency with NLMSPhaseM and to avoid wasted work; Phase D doesn't
+    // have the Exp overflow path Phase M does, but the pattern is uniform.
+    if BasisSqSum <= 0 then Continue;
+    Denom := BasisSqSum + FNlmsDelta;
     Err := FTargetPreRow[J] - FPhiRow[J];
     Step := FNlmsEta * Err / Denom;
     for M := 0 to 3 do
