@@ -35,11 +35,10 @@ Mechanism specification:    docs/kan_attention_spec.md §5, §6, §7
 Implementation decisions:   docs/kan_implementation_pascal.md §5
 
 v1 status: §7 pipeline body, both NLMS phases, gauge, mechanism #1
-cascade, KL/handover, basis evaluation, and the chain-decorator fallback
-are all implemented. Stubs remaining (non-blocking for first run):
-SaveDataToString / LoadDataFromString / SaveStructureToString. Layer-info
-backref (for clip-rate plumbing) and ZeroOutputForInactive are deferred
-to a v2 pass that also lands DoSquaring; see Compute's header comment.
+cascade, KL/handover, basis evaluation, chain-decorator fallback, and
+state save/load round-trip are all implemented. Layer-info backref (for
+clip-rate plumbing) and ZeroOutputForInactive are deferred to a v2 pass
+that also lands DoSquaring; see Compute's header comment.
 *)
 
 
@@ -379,21 +378,125 @@ begin
 end;
 
 function TNNetKANNormaliser.SaveDataToString: string;
+// Spec 8.1, 8.3: per-head state serialisation. Pipe-delimited key=value
+// pairs; floats via CAI's locale-safe NeuralFloatToStr; the UInt64 RNG
+// state is round-tripped through Int64 (bitwise reinterpretation, decimal
+// representation works correctly even for high-bit-set values because the
+// cast is unsigned->signed and back); the +Infinity KLEMA sentinel
+// (cold-start) is encoded as the literal "inf" because FloatToStr's
+// behaviour on Inf is platform-dependent.
+//
+// Coefficients are a space-separated tail in the same string. Round-trip
+// precision is whatever NeuralFloatToStr provides for TNeuralFloat=Single
+// (typically 7-9 significant digits); coefficient drift below this is
+// smoothed by NLMS on the first inference pass post-load anyway.
+var
+  I: integer;
+  KLEMAStr, RNGStr: string;
 begin
-  // TODO: serialise FHead.Coeffs, FHead.Status, FHead.KLEMA, counters,
-  // FCascadeCapHits, FRNG^.State.
-  Result := '';
+  if IsInfinite(FHead.KLEMA) then
+    KLEMAStr := 'inf'
+  else
+    KLEMAStr := NeuralFloatToStr(FHead.KLEMA);
+  if FRNG <> nil then
+    RNGStr := IntToStr(Int64(FRNG^.State))
+  else
+    RNGStr := '0';
+  Result := Format('status=%d|klema=%s|conslow=%d|clipcnt=%d|caphits=%d|rng=%s|coeffs=',
+    [Ord(FHead.Status), KLEMAStr, FHead.ConsecutiveLowPasses,
+     FHead.ClipCountTotal, FCascadeCapHits, RNGStr]);
+  for I := 0 to Length(FHead.Coeffs) - 1 do
+  begin
+    if I > 0 then Result := Result + ' ';
+    Result := Result + NeuralFloatToStr(FHead.Coeffs[I]);
+  end;
 end;
 
 procedure TNNetKANNormaliser.LoadDataFromString(strData: string);
+// Inverse of SaveDataToString. Validates coefficient count against current
+// FGridSpec.KnotCount and raises EKANBadState on mismatch (loading a
+// checkpoint from a different grid configuration would silently corrupt
+// the per-head state, so we fail fast). Unknown keys are silently ignored
+// for forward compatibility with future state additions.
+var
+  Fields, CoeffStrs: TStringList;
+  Sep, I, KnotN: integer;
+  Part, Key, Val: string;
 begin
-  // TODO: inverse of SaveDataToString.
+  if Trim(strData) = '' then
+    raise EKANBadState.Create(
+      'TNNetKANNormaliser.LoadDataFromString: empty data string');
+  Fields := TStringList.Create;
+  CoeffStrs := TStringList.Create;
+  try
+    Fields.StrictDelimiter := True;
+    Fields.Delimiter := '|';
+    Fields.DelimitedText := strData;
+    for I := 0 to Fields.Count - 1 do
+    begin
+      Part := Fields[I];
+      Sep := Pos('=', Part);
+      if Sep <= 0 then Continue;
+      Key := Copy(Part, 1, Sep - 1);
+      Val := Copy(Part, Sep + 1, MaxInt);
+      if Key = 'status' then
+        FHead.Status := TKANStatus(StrToInt(Val))
+      else if Key = 'klema' then
+      begin
+        if LowerCase(Val) = 'inf' then
+          FHead.KLEMA := Infinity
+        else
+          FHead.KLEMA := NeuralStrToFloat(Val);
+      end
+      else if Key = 'conslow' then
+        FHead.ConsecutiveLowPasses := StrToInt(Val)
+      else if Key = 'clipcnt' then
+        FHead.ClipCountTotal := StrToInt(Val)
+      else if Key = 'caphits' then
+        FCascadeCapHits := StrToInt(Val)
+      else if Key = 'rng' then
+      begin
+        if FRNG <> nil then
+          FRNG^.State := UInt64(StrToInt64(Val));
+      end
+      else if Key = 'coeffs' then
+      begin
+        CoeffStrs.StrictDelimiter := True;
+        CoeffStrs.Delimiter := ' ';
+        CoeffStrs.DelimitedText := Val;
+        KnotN := Length(FHead.Coeffs);
+        if CoeffStrs.Count <> KnotN then
+          raise EKANBadState.CreateFmt(
+            'TNNetKANNormaliser.LoadDataFromString: coefficient count mismatch ' +
+            '(got %d, expected %d for grid KnotCount=%d)',
+            [CoeffStrs.Count, KnotN, FGridSpec.KnotCount]);
+        for I := 0 to KnotN - 1 do
+          FHead.Coeffs[I] := NeuralStrToFloat(CoeffStrs[I]);
+      end;
+      // Unknown keys are silently ignored for forward compatibility.
+    end;
+  finally
+    CoeffStrs.Free;
+    Fields.Free;
+  end;
 end;
 
 function TNNetKANNormaliser.SaveStructureToString: string;
+// Spec 8.1: structure (immutable, set at construction) is the grid spec
+// plus the per-network identity (layer + head). The actual chain
+// reconstruction is the network builder's responsibility (re-running
+// TKANNet.AddKANSelfAttention with the appropriate parameters); this
+// string is mostly diagnostic/audit, but is also used by LoadDataFromString
+// (via the network layer-load loop) to validate that the loaded data
+// matches the current structure.
 begin
-  // TODO: serialise GridSpec + cached configuration values.
-  Result := inherited SaveStructureToString;
+  Result := inherited SaveStructureToString
+            + ' kanlow=' + NeuralFloatToStr(FGridSpec.GridLow)
+            + ' kanhigh=' + NeuralFloatToStr(FGridSpec.GridHigh)
+            + ' kanknots=' + IntToStr(FGridSpec.KnotCount)
+            + ' kanorder=' + IntToStr(FGridSpec.BasisOrder)
+            + ' kanlayer=' + IntToStr(FAttentionLayerId)
+            + ' kanhead=' + IntToStr(FHeadIndex);
 end;
 
 procedure TNNetKANNormaliser.EnterInferenceMode;
