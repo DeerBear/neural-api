@@ -176,6 +176,13 @@ type
     property KANEnabled: boolean read FKANEnabled write FKANEnabled;
     property FreezeAfterTakeover: boolean read FFreezeAfterTakeover write FFreezeAfterTakeover;
     property SkipRedundantSoftmax: boolean read FSkipRedundantSoftmax write FSkipRedundantSoftmax;
+
+    // --- Tunable parameters (set by AddKANSelfAttention before LockToInference;
+    //     defaults from constructor follow spec §11). Validation lives at the
+    //     builder call site so caller-supplied bad values fail fast.
+    property SharpenAlpha: TNeuralFloat read FSharpenAlpha write FSharpenAlpha;
+    property KLThreshold: TNeuralFloat read FEpsilonKL write FEpsilonKL;
+    property KLConfirmPasses: integer read FNConfirm write FNConfirm;
   end;
 
 implementation
