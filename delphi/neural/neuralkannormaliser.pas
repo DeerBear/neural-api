@@ -150,6 +150,12 @@ type
                        const AttentionLayerId, HeadIndex: integer;
                        const SharedBasis: TKANBasis;
                        const SharedRNG: PKANSeededRNG); reintroduce;
+    /// Parameterless passthrough constructor for the CreateLayer factory
+    /// (worker-thread clones). Leaves FBasis / FRNG nil and KAN disabled —
+    /// Compute short-circuits to inherited (TNNetIdentity) behaviour.
+    /// The class name still reads "TNNetKANNormaliser", which keeps
+    /// CopyWeights' class-name check quiet.
+    constructor CreatePassthrough;
     destructor Destroy; override;
 
     procedure Compute; override;
@@ -234,6 +240,15 @@ begin
   FCascadeCapHits := 0;
 
   // Per-pass scratch buffers are sized lazily (first Compute) when row length is known.
+end;
+
+constructor TNNetKANNormaliser.CreatePassthrough;
+begin
+  inherited Create;
+  FBasis := nil;
+  FRNG := nil;
+  FInferenceMode := false;
+  FKANEnabled := false;
 end;
 
 destructor TNNetKANNormaliser.Destroy;
