@@ -297,7 +297,10 @@ begin
   // (the chain shape AddKANSelfAttention builds is ... -> ReLUL -> Softmax
   // -> KANNormaliser). Same shape and indexing as the softmax output:
   // Depth = number of rows, SizeX*SizeY = per-row column count.
-  PreScores := FPrevLayer.FPrevLayer.Output;
+  // Use the public PrevLayer property to hop past the softmax to its parent;
+  // Delphi's strict protected rule forbids reaching into FPrevLayer directly
+  // from outside the immediate-self access path.
+  PreScores := FPrevLayer.PrevLayer.Output;
   NumRows := PreScores.Depth;
   RowLen := PreScores.SizeX * PreScores.SizeY;
   if (NumRows = 0) or (RowLen = 0) then exit;
@@ -420,7 +423,7 @@ procedure TNNetKANNormaliser.LoadDataFromString(strData: string);
 // for forward compatibility with future state additions.
 var
   Fields, CoeffStrs: TStringList;
-  Sep, I, KnotN: integer;
+  Sep, I, K, KnotN: integer;
   Part, Key, Val: string;
 begin
   if Trim(strData) = '' then
@@ -470,8 +473,8 @@ begin
             'TNNetKANNormaliser.LoadDataFromString: coefficient count mismatch ' +
             '(got %d, expected %d for grid KnotCount=%d)',
             [CoeffStrs.Count, KnotN, FGridSpec.KnotCount]);
-        for I := 0 to KnotN - 1 do
-          FHead.Coeffs[I] := NeuralStrToFloat(CoeffStrs[I]);
+        for K := 0 to KnotN - 1 do
+          FHead.Coeffs[K] := NeuralStrToFloat(CoeffStrs[K]);
       end;
       // Unknown keys are silently ignored for forward compatibility.
     end;
