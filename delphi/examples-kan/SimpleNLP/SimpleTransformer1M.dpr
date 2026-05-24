@@ -89,23 +89,44 @@ type
   end;
 
   procedure TTestFitLoading.LoadDataset;
+  // Streaming line-by-line loader. Replaces TStringList.LoadFromFile + two
+  // backwards-traversal passes with a single forward pass: read a line,
+  // apply min-length filter, lowercase + append sentinel, add to the list,
+  // print progress every 100k lines. Constant working memory during load
+  // (one line buffered at a time, plus the growing FDataset), one pass
+  // instead of three, and visible progress so the user can see it's alive.
   var
-    RowCnt: integer;
+    Reader: TStreamReader;
+    Line: string;
+    LineNum: integer;
   begin
-    FDataset.LoadFromFile(csTrainingFileName);
-    FDatasetSize := FDataset.Count;
-    for RowCnt := FDatasetSize-1 downto 0 do
-    begin
-      // removes too short strings
-      if Length(FDataset[RowCnt])<csMinSampleSize then FDataset.Delete(RowCnt);
+    WriteLn('Streaming dataset from ', csTrainingFileName, '...');
+    Flush(Output);
+    // Pre-size to avoid ~20 reallocation+copy cycles as the list grows.
+    // 2.5M is an over-estimate for TinyStories (~2M stories); over-sizing
+    // costs ~10MB of unused pointer slots, undersizing costs reallocations.
+    FDataset.Capacity := 2500000;
+    Reader := TStreamReader.Create(csTrainingFileName, TEncoding.UTF8);
+    try
+      LineNum := 0;
+      while not Reader.EndOfStream do
+      begin
+        Line := Reader.ReadLine;
+        if Length(Line) >= csMinSampleSize then
+          FDataset.Add(LowerCase(Line) + chr(1));
+        Inc(LineNum);
+        if (LineNum mod 100000) = 0 then
+        begin
+          WriteLn('  read ', LineNum, ' lines, kept ', FDataset.Count);
+          Flush(Output);
+        end;
+      end;
+    finally
+      Reader.Free;
     end;
     FDatasetSize := FDataset.Count;
-    for RowCnt := FDatasetSize-1 downto 0 do
-    begin
-      // removes too short strings
-      FDataset[RowCnt] := LowerCase(FDataset[RowCnt]) + chr(1);
-    end;
     WriteLn('Loaded dataset with ', FDatasetSize, ' rows');
+    Flush(Output);
   end;
 
   procedure TTestFitLoading.DoRun;
