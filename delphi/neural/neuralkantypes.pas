@@ -126,12 +126,12 @@ begin
   // unsigned wraparound, and Trunc() of a negative Single is cast bit-wise
   // into UInt64. Delphi's default {$Q+}/{$R+} would raise EIntOverflow /
   // ERangeError on these otherwise.
-  {$PUSH}{$Q-}{$R-}
+  {$Q-}{$R-}
   Result := UInt64(KnotCount) * UInt64($9E3779B97F4A7C15);
   Result := Result xor (UInt64(BasisOrder) * UInt64($BF58476D1CE4E5B9));
   Result := Result xor (UInt64(Trunc(GridLow * 1000)) * UInt64($94D049BB133111EB));
   Result := Result xor (UInt64(Trunc(GridHigh * 1000)) * UInt64($D6E8FEB86659FD93));
-  {$POP}
+  {$Q+}{$R+}
 end;
 
 // =====================================================================
@@ -148,13 +148,13 @@ begin
   // SplitMix64 relies on modular UInt64 arithmetic — the add and the two
   // mixing multiplies are expected to wrap. Disable Delphi's default
   // {$Q+}/{$R+} for the routine body.
-  {$PUSH}{$Q-}{$R-}
+  {$Q-}{$R-}
   State := State + UInt64($9E3779B97F4A7C15);
   Result := State;
   Result := (Result xor (Result shr 30)) * UInt64($BF58476D1CE4E5B9);
   Result := (Result xor (Result shr 27)) * UInt64($94D049BB133111EB);
   Result := Result xor (Result shr 31);
-  {$POP}
+  {$Q+}{$R+}
 end;
 
 function TKANSeededRNG.NextFloat: TNeuralFloat;

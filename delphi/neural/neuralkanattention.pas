@@ -406,9 +406,9 @@ begin
   Inc(FNextAttentionLayerId);
   // Unsigned wraparound is intentional; disable Delphi's default
   // {$Q+}/{$R+} just for this expression.
-  {$PUSH}{$Q-}{$R-}
+  {$Q-}{$R-}
   Seed := (UInt64(AttentionLayerId + 1) * UInt64($9E3779B97F4A7C15)) xor Spec.Hash;
-  {$POP}
+  {$Q+}{$R+}
   if Seed = 0 then Seed := 1;
 
   Info := TKANAttentionLayerInfo.Create(AttentionLayerId, Spec, HMax, Seed,
