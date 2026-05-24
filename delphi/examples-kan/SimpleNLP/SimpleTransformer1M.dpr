@@ -78,6 +78,12 @@ type
     NFit: TNeuralDataLoadingFit;
     FSampler: TNNetSamplerBase;
     FMaxPredictCharPos: integer;
+    // Plateau-based early stopping: track best ValidationLoss and the
+    // epoch it was achieved. If PlateauWindow epochs pass without a new
+    // record, the run is treated as converged and ShouldQuit is signalled.
+    FBestLoss: TNeuralFloat;
+    FBestLossEpoch: integer;
+    FPlateauWindow: integer;
     procedure LoadDataset;
     procedure DoRun; override;
   public
@@ -190,6 +196,9 @@ type
     NFit.AvgWeightEpochCount := 1;
     NFit.OnAfterEpoch := OnAfterEpoch;
     NFit.OnAfterStep := OnAfterStep;
+    FBestLoss := 1e30;
+    FBestLossEpoch := 0;
+    FPlateauWindow := 10;
     NFit.FitLoading(
       FNN,
       {TrainingVolumesCount=}32000*3,
@@ -225,6 +234,25 @@ type
     WriteLn(GenerateStringFromChars(NFit.NN, 'she and he ', FSampler),'.');
     WriteLn(GenerateStringFromChars(NFit.NN, 'in the park ', FSampler),'.');
     WriteLn(GenerateStringFromChars(NFit.NN, 'billy ', FSampler),'.');
+
+    // Plateau check. Skip when invoked from outside the training loop
+    // (the post-LockToInference call passes Self as Sender, NFit may
+    // be mid-teardown).
+    if Sender = NFit then
+    begin
+      if NFit.ValidationLoss < FBestLoss then
+      begin
+        FBestLoss := NFit.ValidationLoss;
+        FBestLossEpoch := NFit.CurrentEpoch;
+      end
+      else if (NFit.CurrentEpoch - FBestLossEpoch) >= FPlateauWindow then
+      begin
+        WriteLn(Format(
+          'Plateau: no ValidationLoss improvement for %d epochs (best %.4f at epoch %d). Stopping.',
+          [FPlateauWindow, FBestLoss, FBestLossEpoch]));
+        NFit.ShouldQuit := true;
+      end;
+    end;
   end;
 
   procedure TTestFitLoading.OnAfterStep(Sender: TObject);
