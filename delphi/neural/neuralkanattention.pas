@@ -382,6 +382,18 @@ begin
     raise EKANBadState.CreateFmt(
       'AddKANSelfAttention: InitialHeads %d must be in [2, HMax=%d]',
       [InitialHeads, HMax]);
+  if SharpenAlpha <= 1.0 then
+    raise EKANBadState.CreateFmt(
+      'AddKANSelfAttention: SharpenAlpha %g must be > 1 (spec §5.5.3)',
+      [SharpenAlpha]);
+  if KLThreshold <= 0 then
+    raise EKANBadState.CreateFmt(
+      'AddKANSelfAttention: KLThreshold %g must be > 0 (nats, spec §6.3)',
+      [KLThreshold]);
+  if KLConfirmPasses < 1 then
+    raise EKANBadState.CreateFmt(
+      'AddKANSelfAttention: KLConfirmPasses %d must be >= 1 (spec §6.3)',
+      [KLConfirmPasses]);
 
   // (2) Build grid spec and per-layer info. Seed combines a per-network
   // counter with the grid hash so two layers with the same spec still get
@@ -402,11 +414,6 @@ begin
   Info := TKANAttentionLayerInfo.Create(AttentionLayerId, Spec, HMax, Seed,
     SquaringClipRate, SquaringSweeps, 0.01, InitialHeads);
   FAttentionLayers.Add(Info);
-
-  // SharpenAlpha / KLThreshold / KLConfirmPasses are not yet propagated to
-  // each TNNetKANNormaliser instance — the normaliser still uses its own
-  // defaults from its constructor. Wiring these through requires adding
-  // published-property setters on the normaliser; out of scope for v1.
 
   // (3) Q/K/V projections — mirror AddSelfAttention's no-HasNorm branch.
   QueryGroup := AddLayerAfter([TNNetPointwiseConvLinear.Create(PreviousDepth, 1)], PreviousLayer);
@@ -443,6 +450,9 @@ begin
 
     Normaliser := TNNetKANNormaliser.Create(Spec, AttentionLayerId, HeadCnt,
                                             Info.Basis, @Info.FRNG);
+    Normaliser.SharpenAlpha := SharpenAlpha;
+    Normaliser.KLThreshold := KLThreshold;
+    Normaliser.KLConfirmPasses := KLConfirmPasses;
     NormaliserLayer := AddLayer(Normaliser);
     Info.RegisterNormaliser(Normaliser);
 
