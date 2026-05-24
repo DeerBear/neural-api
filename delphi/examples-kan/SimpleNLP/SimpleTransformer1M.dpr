@@ -157,7 +157,7 @@ type
     begin
       PrevLayer := FNN.GetLastLayer();
       EmbeddingDim := PrevLayer.Output.Depth;
-      Attended := FNN.AddKANSelfAttention({InitialHeads=}16);
+      Attended := FNN.AddKANSelfAttention({InitialHeads=}16, {HeadCeiling=}16);
       AttendedPlusPrev := FNN.AddLayer( TNNetSum.Create([Attended, PrevLayer]) );
       AttendedPlusPrev := FNN.AddLayer( TNNetSignedSquareRoot1.Create() );
       FNN.AddLayer( TNNetPointwiseConvReLU.Create(512, 1) );
