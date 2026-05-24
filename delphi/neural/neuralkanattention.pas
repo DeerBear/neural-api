@@ -629,10 +629,14 @@ end;
 // Cloned networks (worker threads) never have LockToInference called
 // on them -- FInferenceMode stays false throughout -- so the cloned
 // KAN normaliser only ever needs to behave as identity passthrough.
-// A vanilla TNNetIdentity satisfies both contracts: same I/O shape
-// as TNNetKANNormaliser (it's the parent class), and CopyWeights is a
-// no-op (no neurons, no weight buffers). Only the original FNN's
-// TNNetKANNormaliser instances ever flip to active KAN mode.
+// We return a TNNetKANNormaliser shell (via the parameterless
+// CreatePassthrough constructor) rather than a plain TNNetIdentity so
+// CopyWeights' source.ClassName = dest.ClassName check is satisfied --
+// otherwise the framework spams "Origin class name TNNetKANNormaliser
+// differs from TNNetIdentity at copy weights" on every weight sync.
+// The shell has FBasis = FRNG = nil and FInferenceMode = false, so
+// Compute short-circuits to inherited (TNNetIdentity) passthrough and
+// the nil shared resources are never dereferenced.
 //
 // Returning nil means "not a class I handle" -- the registry then tries
 // other registered factories before raising the original exception.
@@ -644,7 +648,7 @@ begin
   S := CreateTokenizedStringList(strData, ':');
   try
     if (S.Count > 0) and (S[0] = 'TNNetKANNormaliser') then
-      Result := TNNetIdentity.Create;
+      Result := TNNetKANNormaliser.CreatePassthrough;
   finally
     S.Free;
   end;
