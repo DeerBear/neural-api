@@ -177,8 +177,13 @@ type
     // --- Telemetry ---
     function  KANTelemetry: string;
 
-    // --- Training-method overrides that gate on lock state ---
-    procedure Backpropagate(pInput: TNNetVolume); override;
+    // --- Training-method gate on lock state ---
+    // Parent TNNet.Backpropagate(pOutput: TNNetVolume) is overload but not
+    // virtual, so we can't override it. reintroduce; overload; shadows it
+    // for calls through a TKANNet reference; calls through a TNNet
+    // reference bypass our assertion (defence-in-depth only -- the per-
+    // layer normaliser has its own lock check in Backpropagate).
+    procedure Backpropagate(pInput: TNNetVolume); reintroduce; overload;
 
     property InferenceLocked: boolean read FInferenceLocked;
     property AttentionLayers: TList read FAttentionLayers;
