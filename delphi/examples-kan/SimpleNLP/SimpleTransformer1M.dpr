@@ -166,8 +166,8 @@ type
     NFit.EnableClassComparison();
     NFit.EnableDefaultLoss();
     NFit.AvgWeightEpochCount := 1;
-    NFit.OnAfterEpoch := @OnAfterEpoch;
-    NFit.OnAfterStep := @OnAfterStep;
+    NFit.OnAfterEpoch := OnAfterEpoch;
+    NFit.OnAfterStep := OnAfterStep;
     NFit.FitLoading(
       FNN,
       {TrainingVolumesCount=}32000*3,
@@ -175,7 +175,7 @@ type
       {TestVolumesCount=}32000*3 div 20,
       {batchsize=}32,
       {epochs=}500,
-      @GetTrainingPair, @GetValidationPair, @GetTestPair
+      GetTrainingPair, GetValidationPair, GetTestPair
     );
     FNN.DebugWeights();
 
