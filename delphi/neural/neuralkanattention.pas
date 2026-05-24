@@ -43,7 +43,7 @@ interface
 
 uses
   Classes, SysUtils, Math,
-  neuralvolume, neuralnetwork,
+  neuralvolume, neuralnetwork, neuralfit,
   neuralkantypes, neuralkanbasis, neuralkannormaliser;
 
 type
@@ -176,6 +176,47 @@ type
 
     // --- Telemetry ---
     function  KANTelemetry: string;
+
+    // --- Post-lock alpha auto-tuner (spec extension; not in original spec) ---
+    /// Set SharpenAlpha on every TNNetKANNormaliser across all attention layers.
+    /// Bulk operation used by CalibrateAlpha and available for manual override.
+    procedure SetAllAlpha(const Value: TNeuralFloat);
+
+    /// Read the current SharpenAlpha. Returns the value from the first
+    /// normaliser in the first attention layer (all are kept in sync by
+    /// SetAllAlpha; if the caller has set them per-head manually this is
+    /// the wrong accessor).
+    function  GetCurrentAlpha: TNeuralFloat;
+
+    /// Continuous EMA-driven SharpenAlpha calibrator. Runs a finite-difference
+    /// gradient descent on validation cross-entropy loss, EMA-smoothing the
+    /// trajectory, and writes the converged alpha to every normaliser.
+    ///
+    /// Must be called post-LockToInference. Pure inference; does not modify
+    /// network weights, only the SharpenAlpha hyperparameter on KAN normalisers.
+    ///
+    /// Each iteration:
+    ///   1. Sample SamplesPerIter validation examples.
+    ///   2. For each: forward 3x at alpha-AlphaStep, alpha, alpha+AlphaStep.
+    ///   3. Estimate dLoss/dAlpha via central finite difference.
+    ///   4. SGD step on alpha (clipped to [AlphaMin, AlphaMax]).
+    ///   5. EMA-smooth: alpha_ema := (1-EMABeta)*alpha_ema + EMABeta*alpha.
+    /// Final write uses alpha_ema.
+    ///
+    /// Cost: 3 * SamplesPerIter * Iterations forward passes. With defaults
+    /// (Iterations=20, SamplesPerIter=16) that's 960 forwards -- roughly
+    /// 1/5 of a full validation pass.
+    procedure CalibrateAlpha(
+      GetValidationPair: TNNetGet2VolumesProc;
+      const ValidationCount: integer;
+      const Iterations: integer = 20;
+      const SamplesPerIter: integer = 16;
+      const AlphaMin: TNeuralFloat = 0.5;
+      const AlphaMax: TNeuralFloat = 3.0;
+      const AlphaStep: TNeuralFloat = 0.05;
+      const LearningRate: TNeuralFloat = 0.2;
+      const EMABeta: TNeuralFloat = 0.3
+    );
 
     // --- Training-method gate on lock state ---
     // Parent TNNet.Backpropagate(pOutput: TNNetVolume) is overload but not
@@ -616,6 +657,139 @@ procedure TKANNet.Backpropagate(pInput: TNNetVolume);
 begin
   AssertNotLocked('Backpropagate');
   inherited Backpropagate(pInput);
+end;
+
+// =====================================================================
+//  Post-lock alpha auto-tuner
+// =====================================================================
+
+procedure TKANNet.SetAllAlpha(const Value: TNeuralFloat);
+var
+  i, j: integer;
+  Info: TKANAttentionLayerInfo;
+begin
+  for i := 0 to FAttentionLayers.Count - 1 do
+  begin
+    Info := TKANAttentionLayerInfo(FAttentionLayers[i]);
+    for j := 0 to Info.Normalisers.Count - 1 do
+      TNNetKANNormaliser(Info.Normalisers[j]).SharpenAlpha := Value;
+  end;
+end;
+
+function TKANNet.GetCurrentAlpha: TNeuralFloat;
+var
+  Info: TKANAttentionLayerInfo;
+begin
+  if (FAttentionLayers.Count = 0) then
+    raise EKANBadState.Create('GetCurrentAlpha: no attention layers');
+  Info := TKANAttentionLayerInfo(FAttentionLayers[0]);
+  if (Info.Normalisers.Count = 0) then
+    raise EKANBadState.Create('GetCurrentAlpha: no normalisers in layer 0');
+  Result := TNNetKANNormaliser(Info.Normalisers[0]).SharpenAlpha;
+end;
+
+procedure TKANNet.CalibrateAlpha(
+  GetValidationPair: TNNetGet2VolumesProc;
+  const ValidationCount: integer;
+  const Iterations: integer;
+  const SamplesPerIter: integer;
+  const AlphaMin: TNeuralFloat;
+  const AlphaMax: TNeuralFloat;
+  const AlphaStep: TNeuralFloat;
+  const LearningRate: TNeuralFloat;
+  const EMABeta: TNeuralFloat
+);
+// Continuous EMA-driven SharpenAlpha calibration. See interface docstring
+// for algorithm. The implementation is single-threaded for simplicity; the
+// total cost is ~3*SamplesPerIter*Iterations forward passes which is small
+// compared to a full validation pass (1/5 with defaults).
+//
+// Loss function mirrors TNeuralDataLoadingFit.DefaultLossFn:
+// classification cross-entropy = -ln(output[expected.Tag]).
+var
+  InputVol, ExpectedVol: TNNetVolume;
+  Iter, S, Idx, ClassId: integer;
+  AlphaInitial, AlphaCenter, AlphaEMA, AlphaUp, AlphaDown: TNeuralFloat;
+  LossSumCenter, LossSumUp, LossSumDown: TNeuralFloat;
+  Gradient, NewAlpha, OutputValue: TNeuralFloat;
+  LastLayer: TNNetLayer;
+
+  procedure AccumulateLoss(const Alpha: TNeuralFloat; var LossSum: TNeuralFloat);
+  begin
+    SetAllAlpha(Alpha);
+    Compute(InputVol);
+    ClassId := ExpectedVol.Tag;
+    OutputValue := LastLayer.Output.FData[ClassId];
+    if OutputValue > 0 then
+      LossSum := LossSum + (-Ln(OutputValue))
+    else
+      LossSum := LossSum + 100;
+  end;
+
+begin
+  AssertLocked('CalibrateAlpha');
+  if FAttentionLayers.Count = 0 then exit;
+  if not Assigned(GetValidationPair) then
+    raise EKANBadState.Create('CalibrateAlpha: GetValidationPair is nil');
+  if ValidationCount <= 0 then
+    raise EKANBadState.Create('CalibrateAlpha: ValidationCount must be > 0');
+
+  AlphaInitial := GetCurrentAlpha;
+  AlphaCenter  := AlphaInitial;
+  AlphaEMA     := AlphaInitial;
+  LastLayer    := GetLastLayer;
+
+  InputVol    := TNNetVolume.Create;
+  ExpectedVol := TNNetVolume.Create;
+  try
+    WriteLn(Format(
+      'KAN alpha calibration: %d iterations x %d samples, initial alpha=%.3f',
+      [Iterations, SamplesPerIter, AlphaCenter]));
+
+    for Iter := 0 to Iterations - 1 do
+    begin
+      LossSumCenter := 0;
+      LossSumUp     := 0;
+      LossSumDown   := 0;
+
+      AlphaUp   := AlphaCenter + AlphaStep;
+      AlphaDown := AlphaCenter - AlphaStep;
+      if AlphaUp   > AlphaMax then AlphaUp   := AlphaMax;
+      if AlphaDown < AlphaMin then AlphaDown := AlphaMin;
+
+      for S := 0 to SamplesPerIter - 1 do
+      begin
+        Idx := Random(ValidationCount);
+        GetValidationPair(Idx, 0, InputVol, ExpectedVol);
+        AccumulateLoss(AlphaCenter, LossSumCenter);
+        AccumulateLoss(AlphaUp,     LossSumUp);
+        AccumulateLoss(AlphaDown,   LossSumDown);
+      end;
+
+      // Central finite difference. Divide-by-zero guarded by AlphaStep > 0.
+      Gradient := (LossSumUp - LossSumDown) / (2 * (AlphaUp - AlphaDown) * SamplesPerIter);
+      NewAlpha := AlphaCenter - LearningRate * Gradient;
+      if NewAlpha < AlphaMin then NewAlpha := AlphaMin;
+      if NewAlpha > AlphaMax then NewAlpha := AlphaMax;
+
+      AlphaEMA := (1 - EMABeta) * AlphaEMA + EMABeta * NewAlpha;
+
+      WriteLn(Format(
+        '  iter %2d: alpha=%.3f loss=%.4f grad=%+.4f -> new_alpha=%.3f ema=%.3f',
+        [Iter, AlphaCenter, LossSumCenter / SamplesPerIter, Gradient,
+         NewAlpha, AlphaEMA]));
+
+      AlphaCenter := NewAlpha;
+    end;
+
+    SetAllAlpha(AlphaEMA);
+    WriteLn(Format(
+      'KAN alpha calibration done. Final alpha=%.3f (was %.3f)',
+      [AlphaEMA, AlphaInitial]));
+  finally
+    InputVol.Free;
+    ExpectedVol.Free;
+  end;
 end;
 
 // =====================================================================

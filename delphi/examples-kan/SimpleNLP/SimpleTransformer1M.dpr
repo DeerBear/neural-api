@@ -216,9 +216,21 @@ type
     // generates with KAN attention active. LockToInference is one-way --
     // no further training is permitted on FNN.
     FNN.LockToInference;
-    WriteLn('--- KAN attention engaged; post-training generation: ---');
-
+    WriteLn('--- KAN attention engaged; post-training generation (baseline alpha=1.1): ---');
     OnAfterEpoch(Self);
+
+    // v1.1 auto-tuner: run continuous EMA-driven calibration on alpha,
+    // then re-generate with the calibrated value. Both blocks come from
+    // the same locked network so the difference is purely the alpha
+    // hyperparameter -- direct A/B comparison.
+    WriteLn('--- Calibrating SharpenAlpha against validation loss ---');
+    FNN.CalibrateAlpha(
+      GetValidationPair,
+      {ValidationCount=}32000*3 div 20
+    );
+    WriteLn('--- Post-calibration generation: ---');
+    OnAfterEpoch(Self);
+
     FSampler.Free;
     NFit.Free;
     FNN.Free;
