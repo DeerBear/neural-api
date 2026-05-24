@@ -159,7 +159,7 @@ type
 
     WriteLn('Computing...');
     //NFit.MaxThreadNum := 1;
-    NFit.LogEveryBatches := 1000;
+    NFit.LogEveryBatches := 100;     // ~30 log lines/epoch instead of ~3
     NFit.InitialLearningRate := 0.01;
     NFit.Inertia := 0;
     NFit.LearningRateDecay := 0;
