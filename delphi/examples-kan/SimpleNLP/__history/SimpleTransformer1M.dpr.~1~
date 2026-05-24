@@ -40,7 +40,6 @@ Copyright (C) 2023 Joao Paulo Schwarz Schuler
 
 uses
   Classes,
-  SysUtils,
   neuralnetwork in '..\..\neural\neuralnetwork.pas',
   neuralvolume in '..\..\neural\neuralvolume.pas',
   neuralfit in '..\..\neural\neuralfit.pas',
