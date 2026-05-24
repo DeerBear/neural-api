@@ -485,21 +485,17 @@ begin
 end;
 
 function TNNetKANNormaliser.SaveStructureToString: string;
-// Spec 8.1: structure (immutable, set at construction) is the grid spec
-// plus the per-network identity (layer + head). The actual chain
-// reconstruction is the network builder's responsibility (re-running
-// TKANNet.AddKANSelfAttention with the appropriate parameters); this
-// string is mostly diagnostic/audit, but is also used by LoadDataFromString
-// (via the network layer-load loop) to validate that the loaded data
-// matches the current structure.
+// Pass-through to the TNNetIdentity base. The KAN-specific structure
+// (GridSpec, AttentionLayerId, HeadIndex, shared basis + RNG) is
+// reconstructed by re-running TKANNet.AddKANSelfAttention with the
+// appropriate parameters, not via this string. An earlier version
+// appended " kanlow=... kanknots=..." here, but CAI's thread-copy /
+// network-load path tokenises the structure string on spaces and tries
+// to parse each token as a number; the appended key=value tokens broke
+// that parser and raised EConvertError. The KAN config is recoverable
+// from the builder, so this method has no extra payload to contribute.
 begin
-  Result := inherited SaveStructureToString
-            + ' kanlow=' + NeuralFloatToStr(FGridSpec.GridLow)
-            + ' kanhigh=' + NeuralFloatToStr(FGridSpec.GridHigh)
-            + ' kanknots=' + IntToStr(FGridSpec.KnotCount)
-            + ' kanorder=' + IntToStr(FGridSpec.BasisOrder)
-            + ' kanlayer=' + IntToStr(FAttentionLayerId)
-            + ' kanhead=' + IntToStr(FHeadIndex);
+  Result := inherited SaveStructureToString;
 end;
 
 procedure TNNetKANNormaliser.EnterInferenceMode;
