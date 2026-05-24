@@ -2123,7 +2123,26 @@ type
     Threshold: TNeuralFloat = 0.5
   );
 
+type
+  /// Hook signature for third-party layer factories. Plug-in units
+  /// (e.g. the KAN attention extension) register a factory at unit init;
+  /// TNNet.CreateLayer falls through to all registered factories before
+  /// raising "not allowed in CreateLayer." A factory returning nil means
+  /// "I don't recognise this class name -- try the next factory."
+  TNNetCustomLayerFactoryFn = function(const strData: string): TNNetLayer;
+
+procedure RegisterCustomLayerFactory(Fn: TNNetCustomLayerFactoryFn);
+
 implementation
+
+var
+  CustomLayerFactories: array of TNNetCustomLayerFactoryFn;
+
+procedure RegisterCustomLayerFactory(Fn: TNNetCustomLayerFactoryFn);
+begin
+  SetLength(CustomLayerFactories, Length(CustomLayerFactories) + 1);
+  CustomLayerFactories[High(CustomLayerFactories)] := Fn;
+end;
 
 procedure RebuildPatternOnPreviousPatterns
 (
@@ -11484,7 +11503,20 @@ begin
       if S[0] = 'TNNetAddPositionalEmbedding' then Result := TNNetAddPositionalEmbedding.Create(St[0]) else
       if S[0] = 'TNNetEmbedding' then Result := TNNetEmbedding.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetTokenAndPositionalEmbedding' then Result := TNNetTokenAndPositionalEmbedding.Create(St[0], St[1], St[2], Ft[0], Ft[1], St[3]) else
-      raise Exception.create(strData + ' not allowed in CreateLayer.');
+      begin
+        // Fall through to plug-in factories registered via
+        // RegisterCustomLayerFactory. First factory returning a non-nil
+        // result wins. Used by extension units (e.g. KAN attention) that
+        // can't add cases here directly without creating a circular
+        // dependency on neuralnetwork.
+        for I := 0 to High(CustomLayerFactories) do
+        begin
+          Result := CustomLayerFactories[I](strData);
+          if Assigned(Result) then break;
+        end;
+        if not Assigned(Result) then
+          raise Exception.create(strData + ' not allowed in CreateLayer.');
+      end;
     
 
   end

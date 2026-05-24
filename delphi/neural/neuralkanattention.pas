@@ -618,4 +618,39 @@ begin
   inherited Backpropagate(pInput);
 end;
 
+// =====================================================================
+//  CreateLayer plug-in registration
+// =====================================================================
+
+// Returns a passthrough shell for TNNetKANNormaliser when the base
+// CreateLayer dispatch falls through. Used by TNNetDataParallelism /
+// TNNet.Clone, which serialise the original network via
+// SaveStructureToString and rehydrate the layer chain by class name.
+// Cloned networks (worker threads) never have LockToInference called
+// on them -- FInferenceMode stays false throughout -- so the cloned
+// KAN normaliser only ever needs to behave as identity passthrough.
+// A vanilla TNNetIdentity satisfies both contracts: same I/O shape
+// as TNNetKANNormaliser (it's the parent class), and CopyWeights is a
+// no-op (no neurons, no weight buffers). Only the original FNN's
+// TNNetKANNormaliser instances ever flip to active KAN mode.
+//
+// Returning nil means "not a class I handle" -- the registry then tries
+// other registered factories before raising the original exception.
+function KANCustomLayerFactory(const strData: string): TNNetLayer;
+var
+  S: TStringList;
+begin
+  Result := nil;
+  S := CreateTokenizedStringList(strData, ':');
+  try
+    if (S.Count > 0) and (S[0] = 'TNNetKANNormaliser') then
+      Result := TNNetIdentity.Create;
+  finally
+    S.Free;
+  end;
+end;
+
+initialization
+  RegisterCustomLayerFactory(@KANCustomLayerFactory);
+
 end.
