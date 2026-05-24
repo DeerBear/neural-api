@@ -557,10 +557,59 @@ begin
 end;
 
 function TKANNet.KANTelemetry: string;
+// Per-attention-layer diagnostic dump (spec §14.5). Aggregates per-head
+// state into one line per attention layer, suitable for logging at
+// arbitrary cadence post-LockToInference. Format example:
+//
+//   KAN telemetry (2 attention layer(s)):
+//     Layer 0: heads=16/16 status=14SM/2KAN KLema_avg=0.0083 clipRate=0.0021 capHits=0
+//     Layer 1: heads=16/16 status=16SM/0KAN KLema_avg=inf    clipRate=0.0000 capHits=0
+//
+// KLema_avg is the mean across heads whose KLEMA has been initialised
+// past the Infinity cold-start sentinel; if every head is still at the
+// sentinel, "inf" is reported instead. CascadeCapHits is summed across
+// all heads in the layer (rather than averaged) so a single misbehaving
+// head is visible at the layer level. Pre-LockToInference everything
+// reads as the cold-start defaults; the interesting numbers appear
+// after some inference passes have run.
+var
+  i, j: integer;
+  Info: TKANAttentionLayerInfo;
+  N: TNNetKANNormaliser;
+  SMCount, KANCount, FiniteKLCount, TotalCapHits: integer;
+  KLSum: TNeuralFloat;
+  KLAvgStr: string;
 begin
-  // TODO: dump (layer_idx, ActiveHeads, status_distribution, KL_ema_avg,
-  // clip_rate_ema, cascade_cap_hits) per attention layer.
-  Result := '';
+  Result := Format('KAN telemetry (%d attention layer(s)):' + sLineBreak,
+                   [FAttentionLayers.Count]);
+  for i := 0 to FAttentionLayers.Count - 1 do
+  begin
+    Info := TKANAttentionLayerInfo(FAttentionLayers[i]);
+    SMCount := 0;
+    KANCount := 0;
+    FiniteKLCount := 0;
+    TotalCapHits := 0;
+    KLSum := 0;
+    for j := 0 to Info.Normalisers.Count - 1 do
+    begin
+      N := TNNetKANNormaliser(Info.Normalisers[j]);
+      if N.Status = ksSoftmaxActive then Inc(SMCount) else Inc(KANCount);
+      if not IsInfinite(N.KLEMA) then
+      begin
+        KLSum := KLSum + N.KLEMA;
+        Inc(FiniteKLCount);
+      end;
+      TotalCapHits := TotalCapHits + N.CascadeCapHits;
+    end;
+    if FiniteKLCount > 0 then
+      KLAvgStr := Format('%.4f', [KLSum / FiniteKLCount])
+    else
+      KLAvgStr := 'inf';
+    Result := Result + Format(
+      '  Layer %d: heads=%d/%d status=%dSM/%dKAN KLema_avg=%s clipRate=%.4f capHits=%d' + sLineBreak,
+      [Info.AttentionLayerId, Info.ActiveHeads, Info.HMax,
+       SMCount, KANCount, KLAvgStr, Info.ClipRateEMA, TotalCapHits]);
+  end;
 end;
 
 procedure TKANNet.Backpropagate(pInput: TNNetVolume);
