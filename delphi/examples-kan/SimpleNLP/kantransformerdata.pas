@@ -178,6 +178,15 @@ begin
     WriteLn(Format(
       '  Log-log space: mean=%.3f (Exp(Exp(.)) -> %.1f), stddev=%.3f',
       [GetMeanLogLogLen, Exp(Exp(GetMeanLogLogLen)), GetStdLogLogLen]));
+    // Regime classifier. MeanLogLogLen in 0.x means typical Ln(length)
+    // sits in (1, e), i.e. typical length is in (e, e^e) ~ (2.7, 15.2),
+    // so the second log compresses nothing meaningful. Above 1 it does.
+    if GetMeanLogLogLen < 1.0 then
+      WriteLn('  Log-log regime: OVERKILL (mean<1; single log would suffice)')
+    else if GetMeanLogLogLen < 1.5 then
+      WriteLn('  Log-log regime: MARGINAL (mean in [1.0, 1.5); single log is close)')
+    else
+      WriteLn('  Log-log regime: JUSTIFIED (mean>=1.5; second log materially compresses)');
     WriteLn(Format(
       '  Recommended context length (from log-log mean): %d',
       [GetRecommendedContextLen]));
