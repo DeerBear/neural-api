@@ -33,6 +33,20 @@ type
     FNN: TNNet;
     FMaxPredictCharPos: integer;
     FContextLen: integer;
+    // Length-distribution accumulators populated during LoadDataset.
+    // Used to derive a data-driven context length via log-log statistics
+    // (robust to heavy tails: economists use the same trick to compare
+    // wildly different unit scales, e.g. GDP vs population).
+    FLengthSum, FLengthSumSq: double;
+    FLogSum, FLogSumSq: double;
+    FLogLogSum, FLogLogSumSq: double;
+    FMinLen, FMaxLen: integer;
+    function GetMeanLen: double;
+    function GetMeanLogLen: double;
+    function GetStdLogLen: double;
+    function GetMeanLogLogLen: double;
+    function GetStdLogLogLen: double;
+    function GetRecommendedContextLen: integer;
   public
     constructor Create(const AFileName: string; AContextLen: integer);
     destructor Destroy; override;
@@ -53,6 +67,23 @@ type
     // response to training accuracy.
     property MaxPredictCharPos: integer
       read FMaxPredictCharPos write FMaxPredictCharPos;
+    // Length-distribution diagnostics. All populated after LoadDataset.
+    property MinLen: integer read FMinLen;
+    property MaxLen: integer read FMaxLen;
+    property MeanLen: double read GetMeanLen;
+    // Single-log mean: Exp(mean(ln(len))) = geometric mean. Robust if
+    // length distribution is log-normal.
+    property MeanLogLen: double read GetMeanLogLen;
+    property StdLogLen: double read GetStdLogLen;
+    // Double-log mean: Exp(Exp(mean(ln(ln(len))))). Robust even when the
+    // single-log distribution still has a heavy tail (Pareto-like). The
+    // central tendency in log-log space is invariant to outliers that
+    // would yank single-log statistics around.
+    property MeanLogLogLen: double read GetMeanLogLogLen;
+    property StdLogLogLen: double read GetStdLogLogLen;
+    // Data-driven context size from the log-log mean. Use this as the
+    // input to BuildKANTransformer1M unless overridden.
+    property RecommendedContextLen: integer read GetRecommendedContextLen;
   end;
 
 implementation
@@ -67,6 +98,14 @@ begin
   FDatasetSize := 0;
   FMaxPredictCharPos := AContextLen;
   FNN := nil;
+  FLengthSum := 0;
+  FLengthSumSq := 0;
+  FLogSum := 0;
+  FLogSumSq := 0;
+  FLogLogSum := 0;
+  FLogLogSumSq := 0;
+  FMinLen := MaxInt;
+  FMaxLen := 0;
 end;
 
 destructor TKANTransformerDataset.Destroy;
@@ -79,7 +118,8 @@ procedure TKANTransformerDataset.LoadDataset;
 var
   Reader: TStreamReader;
   Line: string;
-  LineNum: integer;
+  LineNum, LineLen: integer;
+  LogLen, LogLogLen: double;
 begin
   WriteLn('Streaming dataset from ', FFileName, '...');
   Flush(Output);
@@ -93,8 +133,28 @@ begin
     while not Reader.EndOfStream do
     begin
       Line := Reader.ReadLine;
-      if Length(Line) >= csMinSampleSize then
+      LineLen := Length(Line);
+      if LineLen >= csMinSampleSize then
+      begin
         FDataset.Add(LowerCase(Line) + chr(1));
+        // Distribution accumulators -- raw, single-log, double-log.
+        // Guard the double-log: Ln(Ln(x)) requires Ln(x) > 0, so x > e
+        // (~2.72). csMinSampleSize=3 satisfies this, but the guard
+        // keeps the code robust if csMinSampleSize is lowered.
+        FLengthSum := FLengthSum + LineLen;
+        FLengthSumSq := FLengthSumSq + LineLen * LineLen;
+        LogLen := Ln(LineLen);
+        FLogSum := FLogSum + LogLen;
+        FLogSumSq := FLogSumSq + LogLen * LogLen;
+        if LogLen > 0 then
+        begin
+          LogLogLen := Ln(LogLen);
+          FLogLogSum := FLogLogSum + LogLogLen;
+          FLogLogSumSq := FLogLogSumSq + LogLogLen * LogLogLen;
+        end;
+        if LineLen < FMinLen then FMinLen := LineLen;
+        if LineLen > FMaxLen then FMaxLen := LineLen;
+      end;
       Inc(LineNum);
       if (LineNum mod 100000) = 0 then
       begin
@@ -107,7 +167,86 @@ begin
   end;
   FDatasetSize := FDataset.Count;
   WriteLn('Loaded dataset with ', FDatasetSize, ' rows');
+  if FDatasetSize > 0 then
+  begin
+    WriteLn(Format(
+      '  Length distribution: min=%d, max=%d, arith mean=%.1f',
+      [FMinLen, FMaxLen, GetMeanLen]));
+    WriteLn(Format(
+      '  Log-space    : mean=%.3f (Exp -> %.1f), stddev=%.3f',
+      [GetMeanLogLen, Exp(GetMeanLogLen), GetStdLogLen]));
+    WriteLn(Format(
+      '  Log-log space: mean=%.3f (Exp(Exp(.)) -> %.1f), stddev=%.3f',
+      [GetMeanLogLogLen, Exp(Exp(GetMeanLogLogLen)), GetStdLogLogLen]));
+    WriteLn(Format(
+      '  Recommended context length (from log-log mean): %d',
+      [GetRecommendedContextLen]));
+  end;
   Flush(Output);
+end;
+
+function TKANTransformerDataset.GetMeanLen: double;
+begin
+  if FDatasetSize > 0 then
+    Result := FLengthSum / FDatasetSize
+  else
+    Result := 0;
+end;
+
+function TKANTransformerDataset.GetMeanLogLen: double;
+begin
+  if FDatasetSize > 0 then
+    Result := FLogSum / FDatasetSize
+  else
+    Result := 0;
+end;
+
+function TKANTransformerDataset.GetStdLogLen: double;
+var
+  M, V: double;
+begin
+  if FDatasetSize > 0 then
+  begin
+    M := FLogSum / FDatasetSize;
+    V := FLogSumSq / FDatasetSize - M * M;
+    if V > 0 then Result := Sqrt(V) else Result := 0;
+  end
+  else
+    Result := 0;
+end;
+
+function TKANTransformerDataset.GetMeanLogLogLen: double;
+begin
+  if FDatasetSize > 0 then
+    Result := FLogLogSum / FDatasetSize
+  else
+    Result := 0;
+end;
+
+function TKANTransformerDataset.GetStdLogLogLen: double;
+var
+  M, V: double;
+begin
+  if FDatasetSize > 0 then
+  begin
+    M := FLogLogSum / FDatasetSize;
+    V := FLogLogSumSq / FDatasetSize - M * M;
+    if V > 0 then Result := Sqrt(V) else Result := 0;
+  end
+  else
+    Result := 0;
+end;
+
+function TKANTransformerDataset.GetRecommendedContextLen: integer;
+begin
+  // Default sizing rule: Exp(Exp(mean(Ln(Ln(len))))). Log-log central
+  // tendency is robust to power-law tails that would dominate single-log
+  // statistics. Caller can override by passing a different ContextLen
+  // to BuildKANTransformer1M.
+  if FDatasetSize > 0 then
+    Result := Round(Exp(Exp(GetMeanLogLogLen)))
+  else
+    Result := FContextLen;
 end;
 
 procedure TKANTransformerDataset.BindNetwork(ANN: TNNet);

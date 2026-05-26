@@ -22,14 +22,20 @@ uses
 
 const
   // Input shape and tokenisation
-  csContextLen        = 81;
+  csContextLen        = 81;      // Legacy default. Prefer passing ContextLen
+                                 // explicitly to BuildKANTransformer1M, sourced
+                                 // from TKANTransformerDataset.RecommendedContextLen
+                                 // (log-log mean of line lengths).
   csVocabSize         = 128;     // 7-bit ASCII char-level vocabulary
 
   // Embedding / sequence-mixing conv
   csConvOutChannels   = 32;      // Per-position ReLU conv depth
   csEmbeddingDim      = 256;     // Sequence-mixing conv output channels
-  csConvKernel        = 13;      // Sequence-mixing kernel + stride: 81 -> 6
-                                 // attention positions
+  csConvKernel        = 13;      // Sequence-mixing kernel + stride. Attention
+                                 // position count = ContextLen div csConvKernel
+                                 // (e.g. 81/13=6, 200/13=15). Attention scales
+                                 // O(N^2) in position count; doubling ContextLen
+                                 // ~quadruples per-layer attention cost.
 
   // Transformer block geometry
   csTransformerBlocks = 2;
@@ -42,20 +48,21 @@ const
   // Output head
   csHiddenLayerSize   = 128;     // FullConnectReLU before vocab head
 
-  // Total params: ~1.39M; check via FNN.CountWeights after construction.
+  // Total params: ~1.39M at ContextLen=81; check via FNN.CountWeights
+  // after construction.
 
-function BuildKANTransformer1M: TKANNet;
+function BuildKANTransformer1M(ContextLen: integer = csContextLen): TKANNet;
 
 implementation
 
-function BuildKANTransformer1M: TKANNet;
+function BuildKANTransformer1M(ContextLen: integer): TKANNet;
 var
   I, EmbeddingDim: integer;
   PrevLayer, Attended, AttendedPlusPrev: TNNetLayer;
 begin
   Result := TKANNet.Create();
   Result.AddLayer([
-    TNNetInput.Create(csContextLen, 1, csVocabSize),
+    TNNetInput.Create(ContextLen, 1, csVocabSize),
     TNNetAddPositionalEmbedding.Create(10000),
     TNNetConvolutionReLU.Create(csConvOutChannels, 1, 0, 1, 0),
     TNNetConvolution.Create(csEmbeddingDim, csConvKernel, 0, csConvKernel, 0)

@@ -116,7 +116,14 @@ begin
   try
     Dataset.LoadDataset;
 
-    Net := BuildKANTransformer1M;
+    // Transplant must build at the checkpoint's training-time ContextLen.
+    // The Q/K indices below (4, 5, 181, 182) are also tied to that
+    // structure: changing ContextLen would not shift them (those layer
+    // positions are determined by attention head count, not context size),
+    // but the loaded weight shapes would mismatch on positional/input
+    // layers. Keep this aligned with the training run that produced the
+    // input checkpoints.
+    Net := BuildKANTransformer1M(csContextLen);
     try
       Dataset.BindNetwork(Net);
 

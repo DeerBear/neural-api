@@ -74,7 +74,11 @@ begin
   try
     Dataset.LoadDataset;
 
-    Net := BuildKANTransformer1M;
+    // Use the data-driven context length derived from the log-log mean
+    // of line lengths. Robust to heavy-tailed length distributions;
+    // economists use the same transform when comparing wildly different
+    // unit scales (GDP vs population, etc.).
+    Net := BuildKANTransformer1M(Dataset.RecommendedContextLen);
     try
       Dataset.BindNetwork(Net);
 

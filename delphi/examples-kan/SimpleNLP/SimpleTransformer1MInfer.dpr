@@ -75,7 +75,12 @@ begin
     // pair-getter indices feed validation samples, same as training time.
     Dataset.LoadDataset;
 
-    Net := BuildKANTransformer1M;
+    // Inference must build the network with the SAME context length the
+    // checkpoint was trained at; positional embedding weights are sized
+    // to ContextLen. Using a different value here would fail to load.
+    // csContextLen is the legacy fixed value (81) used for training runs
+    // up to and including autosave_epoch26.nn.
+    Net := BuildKANTransformer1M(csContextLen);
     try
       Dataset.BindNetwork(Net);
 
