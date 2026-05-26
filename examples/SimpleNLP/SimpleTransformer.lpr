@@ -22,6 +22,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 uses {$IFDEF UNIX} {$IFDEF UseCThreads}
   cthreads, {$ENDIF} {$ENDIF}
   Classes,
+  SysUtils,
   neuralnetwork,
   neuralvolume,
   neuralfit,
@@ -48,6 +49,13 @@ type
     NFit: TNeuralDataLoadingFit;
     FSampler: TNNetSamplerBase;
     FMaxPredictCharPos: integer;
+    // Plateau-based early stopping. Track the best ValidationLoss seen
+    // so far and the epoch it was achieved. If FPlateauWindow epochs
+    // pass without a new record, the run is treated as converged and
+    // NFit.ShouldQuit is signalled.
+    FBestLoss: TNeuralFloat;
+    FBestLossEpoch: integer;
+    FPlateauWindow: integer;
     procedure LoadDataset;
     procedure DoRun; override;
   public
@@ -145,6 +153,9 @@ type
     NFit.AvgWeightEpochCount := 1;
     NFit.OnAfterEpoch := @OnAfterEpoch;
     NFit.OnAfterStep := @OnAfterStep;
+    FBestLoss := 1e30;
+    FBestLossEpoch := 0;
+    FPlateauWindow := 10;
     NFit.FitLoading(
       FNN,
       {TrainingVolumesCount=}32000*3,
@@ -171,6 +182,24 @@ type
     WriteLn(GenerateStringFromChars(NFit.NN, 'she and he ', FSampler),'.');
     WriteLn(GenerateStringFromChars(NFit.NN, 'in the park ', FSampler),'.');
     WriteLn(GenerateStringFromChars(NFit.NN, 'billy ', FSampler),'.');
+
+    // Plateau check. Skip when invoked outside the training loop
+    // (the post-FitLoading final call passes Self as Sender).
+    if Sender = NFit then
+    begin
+      if NFit.ValidationLoss < FBestLoss then
+      begin
+        FBestLoss := NFit.ValidationLoss;
+        FBestLossEpoch := NFit.CurrentEpoch;
+      end
+      else if (NFit.CurrentEpoch - FBestLossEpoch) >= FPlateauWindow then
+      begin
+        WriteLn(Format(
+          'Plateau: no ValidationLoss improvement for %d epochs (best %.4f at epoch %d). Stopping.',
+          [FPlateauWindow, FBestLoss, FBestLossEpoch]));
+        NFit.ShouldQuit := true;
+      end;
+    end;
   end;
 
   procedure TTestFitLoading.OnAfterStep(Sender: TObject);
