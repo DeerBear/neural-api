@@ -474,7 +474,12 @@ begin
         FCascadeCapHits := StrToInt(Val)
       else if Key = 'rng' then
       begin
-        if FRNG <> nil then
+        // Zero tolerated: a passthrough head has FRNG=nil at save time and
+        // SaveDataToString defaults to "rng=0". Because FRNG is shared
+        // across sibling heads in the same attention layer, blindly
+        // assigning 0 here would clobber a real head's seed and cause
+        // EnterInferenceMode to fail. Treat 0 as "no override".
+        if (FRNG <> nil) and (Val <> '0') then
           FRNG^.State := UInt64(StrToInt64(Val));
       end
       else if Key = 'coeffs' then
