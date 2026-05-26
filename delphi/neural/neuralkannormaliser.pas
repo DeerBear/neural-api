@@ -479,6 +479,12 @@ begin
       end
       else if Key = 'coeffs' then
       begin
+        // Empty value tolerated: a passthrough head saves "coeffs=" with no
+        // values (its Coeffs array is length 0 by construction). If the
+        // current network builds the same layer as a real head, the freshly
+        // constructed Coeffs are left untouched here and ColdStartHead in
+        // EnterInferenceMode will populate them on the first inference pass.
+        if Trim(Val) = '' then Continue;
         CoeffStrs.StrictDelimiter := True;
         CoeffStrs.Delimiter := ' ';
         CoeffStrs.DelimitedText := Val;
