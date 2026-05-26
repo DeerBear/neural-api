@@ -270,5 +270,7 @@ begin
   Application := TTestFitLoading.Create(nil);
   Application.Title:='Nano Covolutional Based NLP Trained from File';
   Application.Run;
+  WriteLn('Press ENTER to exit.');
+  ReadLn;
   Application.Free;
 end.

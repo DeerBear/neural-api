@@ -152,4 +152,6 @@ begin
   finally
     Dataset.Free;
   end;
+  WriteLn('Press ENTER to exit.');
+  ReadLn;
 end.
