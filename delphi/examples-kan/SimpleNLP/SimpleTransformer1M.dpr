@@ -6,6 +6,16 @@ KAN-attention variant of the SimpleTransformer NLP example, scaled to
 ~1.4M parameters so the architecture has enough capacity for a serious
 KAN-vs-softmax comparison.
 
+This program is now a thin orchestrator. The actual machinery is split
+across three sibling units so the inference-only program can share
+everything except the training call:
+
+  * kantransformerarch     -- architecture construction (BuildKANTransformer1M).
+  * kantransformerdata     -- TinyStories streaming loader and pair-getters.
+  * kantransformersession  -- training loop, plateau early-stop, weight
+                              clipping stabiliser, LockToInference +
+                              CalibrateAlpha sequence, generation sampler.
+
 Identical to the base SimpleTransformer except:
   * THistoricalNets -> TKANNet  (the KAN-aware network class).
   * Embedding dim raised from 128 to 256 by changing the seq-mixing
@@ -15,39 +25,27 @@ Identical to the base SimpleTransformer except:
   * The transformer block is built by hand instead of via
     AddTransformerBlockCAI, so that the per-head softmax inside the
     attention sub-chain can be replaced by TNNetKANNormaliser via
-    TKANNet.AddKANSelfAttention. The rest of the block (residual sum,
-    FFN, second residual, activations) mirrors the layout of
-    TNNet.AddTransformerBlockCAI byte-for-byte.
+    TKANNet.AddKANSelfAttention.
   * FNN.LockToInference is called after FitLoading completes, so the
-    one post-training GenerateStringFromChars run engages the KAN
-    attention path; everything before that (training + per-epoch
-    sampling) runs through the bit-identical softmax fallback.
+    post-training generation engages the KAN attention path; everything
+    before that (training + per-epoch sampling) runs through the bit-
+    identical softmax fallback.
 
-Paired with delphi/examples/SimpleNLP/SimpleTransformer1M.dpr (same
-architecture, softmax-attention only) for a single-architectural-
-variable A/B. KAN's added spline coefficients are ~2K total
-(KnotCount 64 x Heads 16 x AttentionLayers 2) -- about 0.15% of the
-~1.4M total, so the two variants are essentially param-matched.
-
-Runs only once the KAN implementation stubs have all been filled --
-in v1 several TNNetKANNormaliser pipeline methods (NLMSPhaseM/D,
-the Compute orchestrator, the AddKANSelfAttention builder body) are
-still stubs that raise EKANBadState.
+Paired with delphi/examples/SimpleNLP/SimpleTransformer.lpr (the softmax-
+attention baseline) for a single-architectural-variable A/B comparison.
 
 Copyright (C) 2023 Joao Paulo Schwarz Schuler
 *)
 
-
 uses
   Classes,
   SysUtils,
+  Math,
   neuralnetwork in '..\..\neural\neuralnetwork.pas',
   neuralvolume in '..\..\neural\neuralvolume.pas',
   neuralfit in '..\..\neural\neuralfit.pas',
   neuraldatasets in '..\..\neural\neuraldatasets.pas',
   neuralthread in '..\..\neural\neuralthread.pas',
-  CustApp in '..\..\examples\CustApp.pas',
-  Math,
   neuralab in '..\..\neural\neuralab.pas',
   neuralabfun in '..\..\neural\neuralabfun.pas',
   neuralbit in '..\..\neural\neuralbit.pas',
@@ -58,378 +56,52 @@ uses
   neuralkantypes in '..\..\neural\neuralkantypes.pas',
   neuralkanbasis in '..\..\neural\neuralkanbasis.pas',
   neuralkannormaliser in '..\..\neural\neuralkannormaliser.pas',
-  neuralkanattention in '..\..\neural\neuralkanattention.pas';
+  neuralkanattention in '..\..\neural\neuralkanattention.pas',
+  kantransformerarch in 'kantransformerarch.pas',
+  kantransformerdata in 'kantransformerdata.pas',
+  kantransformersession in 'kantransformersession.pas';
 
 const
-  csContextLen = 81;
   csTrainingFileName = 'datasets/tinystories.txt';
-  csVocabSize  = 128; // Character based vocabulary/dictionary.
-  csMinSampleSize = 3; // Minimum of 3 characters.
-
-  // Energy-conserving per-neuron weight clipping threshold. Per-neuron
-  // weights with |w| > csWeightClipMax get clipped to ±csWeightClipMax
-  // and the excess magnitude is redistributed across the remaining
-  // weights in the same neuron, proportional to their existing
-  // magnitude. Preserves the L1 norm of each neuron's weight vector
-  // while preventing any single weight from initiating runaway
-  // amplification.
-  //
-  // Threshold rationale: observed Q/K projection max weights at epoch 28
-  // (collapse) were ~0.30; at epoch 16 (healthy) they were ~0.15.
-  // 0.20 keeps weights well below the runaway threshold while leaving
-  // headroom for legitimate learning. Tune for v1.1.
-  csWeightClipMax: TNeuralFloat = 0.20;
-
-type
-
-  { TTestFitLoading }
-
-  TTestFitLoading = class(TCustomApplication)
-  protected
-    FDataset: TStringList;
-    FDatasetSize: integer;
-    FNN: TKANNet;
-    NFit: TNeuralDataLoadingFit;
-    FSampler: TNNetSamplerBase;
-    FMaxPredictCharPos: integer;
-    // Plateau-based early stopping: track best ValidationLoss and the
-    // epoch it was achieved. If PlateauWindow epochs pass without a new
-    // record, the run is treated as converged and ShouldQuit is signalled.
-    FBestLoss: TNeuralFloat;
-    FBestLossEpoch: integer;
-    FPlateauWindow: integer;
-    procedure LoadDataset;
-    procedure DoRun; override;
-  public
-    procedure OnAfterEpoch(Sender: TObject);
-    procedure OnAfterStep(Sender: TObject);
-    procedure GetTrainingPair(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume);
-    procedure GetValidationPair(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume);
-    procedure GetTestPair(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume);
-  end;
-
-  procedure TTestFitLoading.LoadDataset;
-  // Streaming line-by-line loader. Replaces TStringList.LoadFromFile + two
-  // backwards-traversal passes with a single forward pass: read a line,
-  // apply min-length filter, lowercase + append sentinel, add to the list,
-  // print progress every 100k lines. Constant working memory during load
-  // (one line buffered at a time, plus the growing FDataset), one pass
-  // instead of three, and visible progress so the user can see it's alive.
-  var
-    Reader: TStreamReader;
-    Line: string;
-    LineNum: integer;
-  begin
-    WriteLn('Streaming dataset from ', csTrainingFileName, '...');
-    Flush(Output);
-    // Pre-size to avoid ~20 reallocation+copy cycles as the list grows.
-    // 2.5M is an over-estimate for TinyStories (~2M stories); over-sizing
-    // costs ~10MB of unused pointer slots, undersizing costs reallocations.
-    FDataset.Capacity := 2500000;
-    Reader := TStreamReader.Create(csTrainingFileName, TEncoding.UTF8);
-    try
-      LineNum := 0;
-      while not Reader.EndOfStream do
-      begin
-        Line := Reader.ReadLine;
-        if Length(Line) >= csMinSampleSize then
-          FDataset.Add(LowerCase(Line) + chr(1));
-        Inc(LineNum);
-        if (LineNum mod 100000) = 0 then
-        begin
-          WriteLn('  read ', LineNum, ' lines, kept ', FDataset.Count);
-          Flush(Output);
-        end;
-      end;
-    finally
-      Reader.Free;
-    end;
-    FDatasetSize := FDataset.Count;
-    WriteLn('Loaded dataset with ', FDatasetSize, ' rows');
-    Flush(Output);
-  end;
-
-  procedure TTestFitLoading.DoRun;
-  var
-    W: TNNetLayer;
-    I: integer;
-    PrevLayer, Attended, AttendedPlusPrev: TNNetLayer;
-    EmbeddingDim: integer;
-  begin
-    FDataset := TStringList.Create();
-    LoadDataset();
-    FNN := TKANNet.Create();
-    NFit := TNeuralDataLoadingFit.Create();
-    FMaxPredictCharPos := 81;
-    FSampler := TNNetSamplerTopP.Create(0.4);
-    FNN.AddLayer([
-      TNNetInput.Create(csContextLen, 1, csVocabSize),
-      TNNetAddPositionalEmbedding.Create(10000),
-      TNNetConvolutionReLU.Create(32,1,0,1,0),
-      TNNetConvolution.Create(256,13,0,13,0)
-    ]);
-
-    // Two KAN-attention transformer blocks. Layout mirrors
-    // TNNet.AddTransformerBlockCAI(Heads=16, IntermediateDim=512, pActFn=
-    // TNNetSignedSquareRoot1) but swaps the per-head softmax in the
-    // attention sub-chain for TNNetKANNormaliser via AddKANSelfAttention.
-    for I := 1 to 2 do
-    begin
-      PrevLayer := FNN.GetLastLayer();
-      EmbeddingDim := PrevLayer.Output.Depth;
-      Attended := FNN.AddKANSelfAttention({InitialHeads=}16, {HeadCeiling=}16);
-      AttendedPlusPrev := FNN.AddLayer( TNNetSum.Create([Attended, PrevLayer]) );
-      AttendedPlusPrev := FNN.AddLayer( TNNetSignedSquareRoot1.Create() );
-      FNN.AddLayer( TNNetPointwiseConvReLU.Create(512, 1) );
-      FNN.AddLayer( TNNetSignedSquareRoot1.Create() );
-      FNN.AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim, 1) );
-      FNN.AddLayer( TNNetSignedSquareRoot1.Create() );
-      FNN.AddLayer( TNNetSum.Create([FNN.GetLastLayer(), AttendedPlusPrev]) );
-      FNN.AddLayer( TNNetSignedSquareRoot1.Create() );
-    end;
-
-    FNN.AddLayer([
-      TNNetFullConnectReLU.Create(128),
-      TNNetFullConnectReLU.Create(csVocabSize),
-      TNNetSoftMax.Create()
-    ]);
-
-    DebugThreadCount();
-    FNN.DebugStructure;
-    FNN.DebugWeights();
-
-    WriteLn('Computing...');
-    //NFit.MaxThreadNum := 1;
-    NFit.LogEveryBatches := 100;     // ~30 log lines/epoch instead of ~3
-    NFit.InitialLearningRate := 0.01;
-    NFit.Inertia := 0;
-    NFit.LearningRateDecay := 0;
-    NFit.L2Decay := 0;
-    NFit.EnableClassComparison();
-    NFit.EnableDefaultLoss();
-    NFit.AvgWeightEpochCount := 1;
-    NFit.OnAfterEpoch := OnAfterEpoch;
-    NFit.OnAfterStep := OnAfterStep;
-    FBestLoss := 1e30;
-    FBestLossEpoch := 0;
-    FPlateauWindow := 10;
-    NFit.FitLoading(
-      FNN,
-      {TrainingVolumesCount=}32000*3,
-      {ValidationVolumesCount=}32000*3 div 20,
-      {TestVolumesCount=}32000*3 div 20,
-      {batchsize=}32,
-      {epochs=}500,
-      GetTrainingPair, GetValidationPair, GetTestPair
-    );
-    FNN.DebugWeights();
-
-    // Training is complete: engage the KAN attention path. After this
-    // call, every TNNetKANNormaliser in FNN switches from passthrough to
-    // its B-spline normaliser. The final OnAfterEpoch below therefore
-    // generates with KAN attention active. LockToInference is one-way --
-    // no further training is permitted on FNN.
-    FNN.LockToInference;
-    WriteLn('--- KAN attention engaged; post-training generation (baseline alpha=1.1): ---');
-    OnAfterEpoch(Self);
-
-    // v1.1 auto-tuner: run continuous EMA-driven calibration on alpha,
-    // then re-generate with the calibrated value. Both blocks come from
-    // the same locked network so the difference is purely the alpha
-    // hyperparameter -- direct A/B comparison.
-    WriteLn('--- Calibrating SharpenAlpha against validation loss ---');
-    FNN.CalibrateAlpha(
-      GetValidationPair,
-      {ValidationCount=}32000*3 div 20
-    );
-    WriteLn('--- Post-calibration generation: ---');
-    OnAfterEpoch(Self);
-
-    FSampler.Free;
-    NFit.Free;
-    FNN.Free;
-    FDataset.Free;
-    Terminate;
-  end;
-
-  procedure TTestFitLoading.OnAfterEpoch(Sender: TObject);
-  begin
-    WriteLn('Testing.');
-    WriteLn(GenerateStringFromChars(NFit.NN, 'once', FSampler),'.');
-    WriteLn(GenerateStringFromChars(NFit.NN, 'lily loved ', FSampler),'.');
-    WriteLn(GenerateStringFromChars(NFit.NN, 'she and he ', FSampler),'.');
-    WriteLn(GenerateStringFromChars(NFit.NN, 'in the park ', FSampler),'.');
-    WriteLn(GenerateStringFromChars(NFit.NN, 'billy ', FSampler),'.');
-
-    // Plateau check. Skip when invoked from outside the training loop
-    // (the post-LockToInference call passes Self as Sender, NFit may
-    // be mid-teardown).
-    if Sender = NFit then
-    begin
-      if NFit.ValidationLoss < FBestLoss then
-      begin
-        FBestLoss := NFit.ValidationLoss;
-        FBestLossEpoch := NFit.CurrentEpoch;
-      end
-      else if (NFit.CurrentEpoch - FBestLossEpoch) >= FPlateauWindow then
-      begin
-        WriteLn(Format(
-          'Plateau: no ValidationLoss improvement for %d epochs (best %.4f at epoch %d). Stopping.',
-          [FPlateauWindow, FBestLoss, FBestLossEpoch]));
-        NFit.ShouldQuit := true;
-      end;
-    end;
-  end;
-
-  // Energy-conserving weight clipping. When a weight exceeds MaxAbs in
-  // absolute value, clip it to ±MaxAbs and redistribute the excess
-  // magnitude across the remaining weights in the same volume,
-  // proportional to their current magnitude. Preserves the L1 norm
-  // (sum of |w_i|) while bounding max(|w_i|) <= MaxAbs.
-  //
-  // The Mechanism-#1 design philosophy applied to network weights:
-  // when a single channel tries to amplify, the optimizer can't drop
-  // the excess into the void -- it has to spread it across other
-  // channels, which disrupts the positive-feedback runaway that broke
-  // the v1.0 training at epoch 28.
-  //
-  // Single-pass: after redistribution some weights may slightly exceed
-  // MaxAbs (bounded by their proportional share). Iterate-to-convergence
-  // is a v1.1.1 refinement; this is the minimal correct implementation.
-  procedure ClipAndSpreadWeights(W: TNNetVolume; const MaxAbs: TNeuralFloat);
-  var
-    I: integer;
-    Weight, AbsWeight, Excess, TotalExcess, UnclippedL1, ScaleFactor: TNeuralFloat;
-    IsClipped: array of boolean;
-  begin
-    if (W = nil) or (W.Size = 0) or (MaxAbs <= 0) then exit;
-
-    SetLength(IsClipped, W.Size);
-    TotalExcess := 0;
-
-    // Pass 1: clip and accumulate excess.
-    for I := 0 to W.Size - 1 do
-    begin
-      Weight := W.FData[I];
-      AbsWeight := Abs(Weight);
-      if AbsWeight > MaxAbs then
-      begin
-        Excess := AbsWeight - MaxAbs;
-        TotalExcess := TotalExcess + Excess;
-        if Weight > 0 then W.FData[I] := MaxAbs
-        else W.FData[I] := -MaxAbs;
-        IsClipped[I] := True;
-      end
-      else
-        IsClipped[I] := False;
-    end;
-
-    if TotalExcess = 0 then exit;
-
-    // Pass 2: L1 norm of unclipped weights.
-    UnclippedL1 := 0;
-    for I := 0 to W.Size - 1 do
-      if not IsClipped[I] then
-        UnclippedL1 := UnclippedL1 + Abs(W.FData[I]);
-
-    // Degenerate cases: all weights clipped, or unclipped weights are zero.
-    // Leave clipped values in place; nowhere to spread the excess.
-    if UnclippedL1 <= 0 then exit;
-
-    // Pass 3: distribute excess proportional to magnitude. Sign-preserving.
-    ScaleFactor := TotalExcess / UnclippedL1;
-    for I := 0 to W.Size - 1 do
-      if not IsClipped[I] then
-      begin
-        Weight := W.FData[I];
-        if Weight > 0 then
-          W.FData[I] := Weight + Abs(Weight) * ScaleFactor
-        else if Weight < 0 then
-          W.FData[I] := Weight - Abs(Weight) * ScaleFactor;
-      end;
-  end;
-
-  procedure TTestFitLoading.OnAfterStep(Sender: TObject);
-  var
-    LayerIdx, NeuronIdx: integer;
-    Layer: TNNetLayer;
-  begin
-    // Apply energy-conserving weight clipping per-neuron across the
-    // entire network after each batch. Per-neuron (rather than per-layer)
-    // preserves the relative weight budgets between output channels;
-    // each channel's weights spread among themselves but channels stay
-    // independent. Cost: ~one O(W) sweep per neuron per batch.
-    for LayerIdx := 0 to FNN.CountLayers - 1 do
-    begin
-      Layer := FNN.Layers[LayerIdx];
-      if Layer.Neurons.Count = 0 then continue;
-      for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
-        ClipAndSpreadWeights(Layer.Neurons[NeuronIdx].Weights, csWeightClipMax);
-    end;
-  end;
-
-  procedure TTestFitLoading.GetTrainingPair(Idx: integer; ThreadId: integer;
-    pInput, pOutput: TNNetVolume);
-  var
-    SampleId: integer;
-    SampleLen: integer;
-    SampleCutPosition: integer;
-    ExpectedTokenChar: char;
-    ExpectedTokenInt: integer;
-  begin
-    // Make sure that expected input and output have the proper sizes.
-    if FNN.GetFirstLayer().Output.Size <> pInput.Size then pInput.ReSize(FNN.GetFirstLayer().Output);
-    if FNN.GetLastLayer().Output.Size <> pOutput.Size then pOutput.ReSize(FNN.GetLastLayer().Output);
-    // Get the input sample
-    SampleId := Random(FDatasetSize);
-    SampleLen := Min(Length(FDataset[SampleId]), pInput.SizeX);
-    SampleLen := Min(FMaxPredictCharPos, SampleLen);
-    SampleCutPosition := Random(SampleLen-csMinSampleSize)+csMinSampleSize; // -1
-    // The expected token is the next character in the string
-    ExpectedTokenChar := FDataset[SampleId][SampleCutPosition+1];
-    ExpectedTokenInt := Min(Ord(ExpectedTokenChar),pInput.Depth-1);
-    // Encode the input and output volumes
-    pInput.OneHotEncodingReversed(copy(FDataset[SampleId], 1, SampleCutPosition));
-    pOutput.SetClassForSoftMax(ExpectedTokenInt);
-    pOutput.Tag := ExpectedTokenInt;
-  end;
-
-  procedure TTestFitLoading.GetValidationPair(Idx: integer; ThreadId: integer;
-    pInput, pOutput: TNNetVolume);
-  var
-    SampleId: integer;
-    SampleLen: integer;
-    SampleCutPosition: integer;
-    ExpectedTokenChar: char;
-    ExpectedTokenInt: integer;
-  begin
-    // Make sure that expected input and output have the proper sizes.
-    if FNN.GetFirstLayer().Output.Size <> pInput.Size then pInput.ReSize(FNN.GetFirstLayer().Output);
-    if FNN.GetLastLayer().Output.Size <> pOutput.Size then pOutput.ReSize(FNN.GetLastLayer().Output);
-    // Get the input sample
-    SampleId := Idx;
-    SampleLen := Min(Length(FDataset[SampleId]), pInput.SizeX);
-    SampleCutPosition := (Idx mod (1+SampleLen-csMinSampleSize))+csMinSampleSize-1;
-    // The expected token is the next character in the string
-    ExpectedTokenChar := FDataset[SampleId][SampleCutPosition+1];
-    ExpectedTokenInt := Min(Ord(ExpectedTokenChar),pInput.Depth-1);
-    // Encode the input and output volumes
-    pInput.OneHotEncodingReversed(copy(FDataset[SampleId], 1, SampleCutPosition));
-    pOutput.SetClassForSoftMax(ExpectedTokenInt);
-    pOutput.Tag := ExpectedTokenInt;
-  end;
-
-  procedure TTestFitLoading.GetTestPair(Idx: integer; ThreadId: integer;
-    pInput, pOutput: TNNetVolume);
-  begin
-    GetValidationPair(Idx, ThreadId, pInput, pOutput);
-  end;
 
 var
-  Application: TTestFitLoading;
+  Dataset: TKANTransformerDataset;
+  Net: TKANNet;
+  Session: TKANTransformerSession;
+  ValidationCount: integer;
 begin
-  Application := TTestFitLoading.Create(nil);
-  Application.Title:='SimpleTransformer1M with KAN Attention (TinyStories)';
-  Application.Run;
-  Application.Free;
+  Dataset := TKANTransformerDataset.Create(csTrainingFileName, csContextLen);
+  try
+    Dataset.LoadDataset;
+
+    Net := BuildKANTransformer1M;
+    try
+      Dataset.BindNetwork(Net);
+
+      DebugThreadCount();
+      Net.DebugStructure;
+      Net.DebugWeights();
+
+      WriteLn('Computing...');
+      Session := TKANTransformerSession.Create(Net, Dataset);
+      try
+        ValidationCount := 32000 * 3 div 20;
+        Session.Train(
+          {TrainingCount=}     32000 * 3,
+          {ValidationCount=}   ValidationCount,
+          {TestCount=}         32000 * 3 div 20,
+          {BatchSize=}         32,
+          {Epochs=}            500
+        );
+        Session.LockAndGenerate;
+        Session.CalibrateAndGenerate(ValidationCount);
+      finally
+        Session.Free;
+      end;
+    finally
+      Net.Free;
+    end;
+  finally
+    Dataset.Free;
+  end;
 end.
