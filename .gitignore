@@ -26,3 +26,4 @@ __pycache__/
 *.nn
 *.txt
 *.dcu
+*.rsm

@@ -22,6 +22,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 uses {$IFDEF UNIX} {$IFDEF UseCThreads}
   cthreads, {$ENDIF} {$ENDIF}
   Classes,
+  SysUtils,
   neuralnetwork,
   neuralvolume,
   neuralfit,
@@ -48,6 +49,13 @@ type
     NFit: TNeuralDataLoadingFit;
     FSampler: TNNetSamplerBase;
     FMaxPredictCharPos: integer;
+    // Plateau-based early stopping. Track the best ValidationLoss seen
+    // so far and the epoch it was achieved. If FPlateauWindow epochs
+    // pass without a new record, the run is treated as converged and
+    // NFit.ShouldQuit is signalled.
+    FBestLoss: TNeuralFloat;
+    FBestLossEpoch: integer;
+    FPlateauWindow: integer;
     procedure LoadDataset;
     procedure DoRun; override;
   public
@@ -59,23 +67,45 @@ type
   end;
 
   procedure TTestFitLoading.LoadDataset;
+  // Streaming line-by-line loader. Replaces TStringList.LoadFromFile + two
+  // backwards-traversal passes with a single forward pass: read a line,
+  // apply min-length filter, lowercase + append sentinel, add to the list,
+  // print progress every 100k lines. Constant working memory during load
+  // (one line buffered at a time, plus the growing FDataset), one pass
+  // instead of three, and visible progress so the user can see it's alive.
   var
-    RowCnt: integer;
+    InputFile: TextFile;
+    Line: string;
+    LineNum: integer;
   begin
-    FDataset.LoadFromFile(csTrainingFileName);
-    FDatasetSize := FDataset.Count;
-    for RowCnt := FDatasetSize-1 downto 0 do
-    begin
-      // removes too short strings
-      if Length(FDataset[RowCnt])<csMinSampleSize then FDataset.Delete(RowCnt);
+    WriteLn('Streaming dataset from ', csTrainingFileName, '...');
+    Flush(Output);
+    // Pre-size to avoid ~20 reallocation+copy cycles as the list grows.
+    // 2.5M is an over-estimate for TinyStories (~2M stories); over-sizing
+    // costs ~10MB of unused pointer slots, undersizing costs reallocations.
+    FDataset.Capacity := 2500000;
+    AssignFile(InputFile, csTrainingFileName);
+    Reset(InputFile);
+    try
+      LineNum := 0;
+      while not EOF(InputFile) do
+      begin
+        ReadLn(InputFile, Line);
+        if Length(Line) >= csMinSampleSize then
+          FDataset.Add(LowerCase(Line) + chr(1));
+        Inc(LineNum);
+        if (LineNum mod 100000) = 0 then
+        begin
+          WriteLn('  read ', LineNum, ' lines, kept ', FDataset.Count);
+          Flush(Output);
+        end;
+      end;
+    finally
+      CloseFile(InputFile);
     end;
     FDatasetSize := FDataset.Count;
-    for RowCnt := FDatasetSize-1 downto 0 do
-    begin
-      // removes too short strings
-      FDataset[RowCnt] := LowerCase(FDataset[RowCnt]) + chr(1);
-    end;
     WriteLn('Loaded dataset with ', FDatasetSize, ' rows');
+    Flush(Output);
   end;
 
   procedure TTestFitLoading.DoRun;
@@ -123,6 +153,9 @@ type
     NFit.AvgWeightEpochCount := 1;
     NFit.OnAfterEpoch := @OnAfterEpoch;
     NFit.OnAfterStep := @OnAfterStep;
+    FBestLoss := 1e30;
+    FBestLossEpoch := 0;
+    FPlateauWindow := 10;
     NFit.FitLoading(
       FNN,
       {TrainingVolumesCount=}32000*3,
@@ -149,6 +182,24 @@ type
     WriteLn(GenerateStringFromChars(NFit.NN, 'she and he ', FSampler),'.');
     WriteLn(GenerateStringFromChars(NFit.NN, 'in the park ', FSampler),'.');
     WriteLn(GenerateStringFromChars(NFit.NN, 'billy ', FSampler),'.');
+
+    // Plateau check. Skip when invoked outside the training loop
+    // (the post-FitLoading final call passes Self as Sender).
+    if Sender = NFit then
+    begin
+      if NFit.ValidationLoss < FBestLoss then
+      begin
+        FBestLoss := NFit.ValidationLoss;
+        FBestLossEpoch := NFit.CurrentEpoch;
+      end
+      else if (NFit.CurrentEpoch - FBestLossEpoch) >= FPlateauWindow then
+      begin
+        WriteLn(Format(
+          'Plateau: no ValidationLoss improvement for %d epochs (best %.4f at epoch %d). Stopping.',
+          [FPlateauWindow, FBestLoss, FBestLossEpoch]));
+        NFit.ShouldQuit := true;
+      end;
+    end;
   end;
 
   procedure TTestFitLoading.OnAfterStep(Sender: TObject);
@@ -219,5 +270,7 @@ begin
   Application := TTestFitLoading.Create(nil);
   Application.Title:='Nano Covolutional Based NLP Trained from File';
   Application.Run;
+  WriteLn('Press ENTER to exit.');
+  ReadLn;
   Application.Free;
 end.
