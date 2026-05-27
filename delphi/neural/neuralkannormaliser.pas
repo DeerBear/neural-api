@@ -169,6 +169,18 @@ type
     /// cold-start initialisation if no prior KAN state exists.
     procedure EnterInferenceMode;
 
+    /// Returns a copy of the current FHead.Coeffs. Length matches
+    /// GridSpec.KnotCount (= Length(FHead.Coeffs) at construction time).
+    /// Used by callers that need to roll back coefficient drift after an
+    /// inference-mode operation -- every Compute call in inference mode
+    /// runs an NLMS Phase M/D update that mutates FHead.Coeffs, so a save
+    /// followed by a sequence of forwards followed by a restore is the
+    /// standard pattern for non-destructive evaluation.
+    function  SnapshotCoeffs: TKANCoeffs;
+    /// Replaces FHead.Coeffs with the contents of Source. Length must
+    /// match Length(FHead.Coeffs); raises EKANBadState otherwise.
+    procedure RestoreCoeffs(const Source: TKANCoeffs);
+
     // --- Telemetry (spec §14.5) ---
     property HeadIndex: integer read FHeadIndex;
     property AttentionLayerId: integer read FAttentionLayerId;
@@ -531,6 +543,27 @@ begin
     raise EKANBadState.Create('TNNetKANNormaliser.EnterInferenceMode: RNG not seeded');
   if FHead.KLEMA = Infinity then ColdStartHead;
   FInferenceMode := true;
+end;
+
+function TNNetKANNormaliser.SnapshotCoeffs: TKANCoeffs;
+var
+  I, N: integer;
+begin
+  N := Length(FHead.Coeffs);
+  SetLength(Result, N);
+  for I := 0 to N - 1 do Result[I] := FHead.Coeffs[I];
+end;
+
+procedure TNNetKANNormaliser.RestoreCoeffs(const Source: TKANCoeffs);
+var
+  I, N: integer;
+begin
+  N := Length(FHead.Coeffs);
+  if Length(Source) <> N then
+    raise EKANBadState.CreateFmt(
+      'TNNetKANNormaliser.RestoreCoeffs: length mismatch (got %d, expected %d)',
+      [Length(Source), N]);
+  for I := 0 to N - 1 do FHead.Coeffs[I] := Source[I];
 end;
 
 procedure TNNetKANNormaliser.EvaluateSplineRow(const ScoresRow: TNNetVolume;

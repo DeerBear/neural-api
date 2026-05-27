@@ -177,6 +177,16 @@ type
     // --- Telemetry ---
     function  KANTelemetry: string;
 
+    // --- Coefficient snapshot/restore (non-destructive evaluation) ---
+    /// Snapshot the FHead.Coeffs of every TNNetKANNormaliser across all
+    /// attention layers (depth-first: layer 0 head 0 .. layer 0 head H-1,
+    /// layer 1 head 0, ...). Pair with RestoreAllCoeffs to undo any
+    /// coefficient drift caused by inference-mode forward passes.
+    function  SnapshotAllCoeffs: TKANCoeffSnapshot;
+    /// Restore from a snapshot produced by SnapshotAllCoeffs. Length must
+    /// match the current normaliser count; raises EKANBadState otherwise.
+    procedure RestoreAllCoeffs(const Snapshot: TKANCoeffSnapshot);
+
     // --- Post-lock alpha auto-tuner (spec extension; not in original spec) ---
     /// Set SharpenAlpha on every TNNetKANNormaliser across all attention layers.
     /// Bulk operation used by CalibrateAlpha and available for manual override.
@@ -189,11 +199,24 @@ type
     function  GetCurrentAlpha: TNeuralFloat;
 
     /// Continuous EMA-driven SharpenAlpha calibrator. Runs a finite-difference
-    /// gradient descent on validation cross-entropy loss, EMA-smoothing the
-    /// trajectory, and writes the converged alpha to every normaliser.
+    /// gradient descent on validation cross-entropy loss and writes the
+    /// selected alpha to every normaliser. Final alpha selection: by default
+    /// the alpha at the iteration with the lowest observed mean loss
+    /// (UseBestAlpha=true). Set UseBestAlpha=false to use the EMA-smoothed
+    /// trajectory endpoint, the previous behaviour. The EMA picker was prone
+    /// to landing on a value that none of the iterations actually scored
+    /// well at, when the noisy gradient pushed the trajectory away from the
+    /// observed minimum (the original symptom that motivated this rewrite).
     ///
-    /// Must be called post-LockToInference. Pure inference; does not modify
-    /// network weights, only the SharpenAlpha hyperparameter on KAN normalisers.
+    /// Must be called post-LockToInference. Every forward pass through a
+    /// TNNetKANNormaliser in inference mode runs a NLMS Phase M/D update
+    /// that mutates FHead.Coeffs (see TNNetKANNormaliser.Compute step 7);
+    /// across the 3*SamplesPerIter*Iterations forward passes the calibrator
+    /// performs, this drift is large enough to wash out the original
+    /// coefficients. PreserveCoeffs (default true) snapshots FHead.Coeffs
+    /// before the sweep and restores it after, so the only persistent
+    /// effect is the SharpenAlpha value. Set PreserveCoeffs=false to let
+    /// the calibration act as adaptive fine-tuning on validation data.
     ///
     /// Each iteration:
     ///   1. Sample SamplesPerIter validation examples.
@@ -201,7 +224,8 @@ type
     ///   3. Estimate dLoss/dAlpha via central finite difference.
     ///   4. SGD step on alpha (clipped to [AlphaMin, AlphaMax]).
     ///   5. EMA-smooth: alpha_ema := (1-EMABeta)*alpha_ema + EMABeta*alpha.
-    /// Final write uses alpha_ema.
+    ///   6. If MeanLoss < best so far, record (alpha, loss).
+    /// Final write uses the alpha selected per UseBestAlpha.
     ///
     /// Cost: 3 * SamplesPerIter * Iterations forward passes. With defaults
     /// (Iterations=20, SamplesPerIter=16) that's 960 forwards -- roughly
@@ -215,7 +239,9 @@ type
       const AlphaMax: TNeuralFloat = 3.0;
       const AlphaStep: TNeuralFloat = 0.05;
       const LearningRate: TNeuralFloat = 0.2;
-      const EMABeta: TNeuralFloat = 0.3
+      const EMABeta: TNeuralFloat = 0.3;
+      const PreserveCoeffs: boolean = true;
+      const UseBestAlpha: boolean = true
     );
 
     // --- Training-method gate on lock state ---
@@ -676,6 +702,51 @@ begin
   end;
 end;
 
+function TKANNet.SnapshotAllCoeffs: TKANCoeffSnapshot;
+var
+  i, j, Idx, Total: integer;
+  Info: TKANAttentionLayerInfo;
+begin
+  Total := 0;
+  for i := 0 to FAttentionLayers.Count - 1 do
+    Total := Total + TKANAttentionLayerInfo(FAttentionLayers[i]).Normalisers.Count;
+  SetLength(Result, Total);
+  Idx := 0;
+  for i := 0 to FAttentionLayers.Count - 1 do
+  begin
+    Info := TKANAttentionLayerInfo(FAttentionLayers[i]);
+    for j := 0 to Info.Normalisers.Count - 1 do
+    begin
+      Result[Idx] := TNNetKANNormaliser(Info.Normalisers[j]).SnapshotCoeffs;
+      Inc(Idx);
+    end;
+  end;
+end;
+
+procedure TKANNet.RestoreAllCoeffs(const Snapshot: TKANCoeffSnapshot);
+var
+  i, j, Idx, Total: integer;
+  Info: TKANAttentionLayerInfo;
+begin
+  Total := 0;
+  for i := 0 to FAttentionLayers.Count - 1 do
+    Total := Total + TKANAttentionLayerInfo(FAttentionLayers[i]).Normalisers.Count;
+  if Length(Snapshot) <> Total then
+    raise EKANBadState.CreateFmt(
+      'TKANNet.RestoreAllCoeffs: normaliser count mismatch (snapshot=%d, current=%d)',
+      [Length(Snapshot), Total]);
+  Idx := 0;
+  for i := 0 to FAttentionLayers.Count - 1 do
+  begin
+    Info := TKANAttentionLayerInfo(FAttentionLayers[i]);
+    for j := 0 to Info.Normalisers.Count - 1 do
+    begin
+      TNNetKANNormaliser(Info.Normalisers[j]).RestoreCoeffs(Snapshot[Idx]);
+      Inc(Idx);
+    end;
+  end;
+end;
+
 function TKANNet.GetCurrentAlpha: TNeuralFloat;
 var
   Info: TKANAttentionLayerInfo;
@@ -697,7 +768,9 @@ procedure TKANNet.CalibrateAlpha(
   const AlphaMax: TNeuralFloat;
   const AlphaStep: TNeuralFloat;
   const LearningRate: TNeuralFloat;
-  const EMABeta: TNeuralFloat
+  const EMABeta: TNeuralFloat;
+  const PreserveCoeffs: boolean;
+  const UseBestAlpha: boolean
 );
 // Continuous EMA-driven SharpenAlpha calibration. See interface docstring
 // for algorithm. The implementation is single-threaded for simplicity; the
@@ -710,9 +783,11 @@ var
   InputVol, ExpectedVol: TNNetVolume;
   Iter, S, Idx, ClassId: integer;
   AlphaInitial, AlphaCenter, AlphaEMA, AlphaUp, AlphaDown: TNeuralFloat;
+  AlphaBest, FinalAlpha, MeanLoss, LossBest: TNeuralFloat;
   LossSumCenter, LossSumUp, LossSumDown: TNeuralFloat;
   Gradient, NewAlpha, OutputValue: TNeuralFloat;
   LastLayer: TNNetLayer;
+  CoeffSnapshot: TKANCoeffSnapshot;
 
   procedure AccumulateLoss(const Alpha: TNeuralFloat; var LossSum: TNeuralFloat);
   begin
@@ -737,14 +812,25 @@ begin
   AlphaInitial := GetCurrentAlpha;
   AlphaCenter  := AlphaInitial;
   AlphaEMA     := AlphaInitial;
+  AlphaBest    := AlphaInitial;
+  LossBest     := Infinity;
   LastLayer    := GetLastLayer;
+
+  // Snapshot coefficients up-front so the sweep's NLMS drift in every
+  // inference-mode forward pass can be undone before we return. SetLength=0
+  // is the "no snapshot taken" sentinel used by the cleanup path below.
+  SetLength(CoeffSnapshot, 0);
+  if PreserveCoeffs then
+    CoeffSnapshot := SnapshotAllCoeffs;
 
   InputVol    := TNNetVolume.Create;
   ExpectedVol := TNNetVolume.Create;
   try
     WriteLn(Format(
-      'KAN alpha calibration: %d iterations x %d samples, initial alpha=%.3f',
-      [Iterations, SamplesPerIter, AlphaCenter]));
+      'KAN alpha calibration: %d iterations x %d samples, initial alpha=%.3f' +
+      ' (preserve=%s, best-alpha=%s)',
+      [Iterations, SamplesPerIter, AlphaCenter,
+       BoolToStr(PreserveCoeffs, True), BoolToStr(UseBestAlpha, True)]));
 
     for Iter := 0 to Iterations - 1 do
     begin
@@ -774,18 +860,31 @@ begin
 
       AlphaEMA := (1 - EMABeta) * AlphaEMA + EMABeta * NewAlpha;
 
+      MeanLoss := LossSumCenter / SamplesPerIter;
+      if MeanLoss < LossBest then
+      begin
+        LossBest  := MeanLoss;
+        AlphaBest := AlphaCenter;
+      end;
+
       WriteLn(Format(
         '  iter %2d: alpha=%.3f loss=%.4f grad=%+.4f -> new_alpha=%.3f ema=%.3f',
-        [Iter, AlphaCenter, LossSumCenter / SamplesPerIter, Gradient,
-         NewAlpha, AlphaEMA]));
+        [Iter, AlphaCenter, MeanLoss, Gradient, NewAlpha, AlphaEMA]));
 
       AlphaCenter := NewAlpha;
     end;
 
-    SetAllAlpha(AlphaEMA);
+    if UseBestAlpha then FinalAlpha := AlphaBest
+                    else FinalAlpha := AlphaEMA;
+
+    if PreserveCoeffs then
+      RestoreAllCoeffs(CoeffSnapshot);
+    SetAllAlpha(FinalAlpha);
+
     WriteLn(Format(
-      'KAN alpha calibration done. Final alpha=%.3f (was %.3f)',
-      [AlphaEMA, AlphaInitial]));
+      'KAN alpha calibration done. Final alpha=%.3f (was %.3f).' +
+      ' best-loss=%.4f at alpha=%.3f; ema alpha=%.3f',
+      [FinalAlpha, AlphaInitial, LossBest, AlphaBest, AlphaEMA]));
   finally
     InputVol.Free;
     ExpectedVol.Free;
