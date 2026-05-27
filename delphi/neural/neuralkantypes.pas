@@ -98,6 +98,14 @@ type
     ClipCountTotal: integer;
   end;
 
+  /// Coefficient buffer types used by TNNetKANNormaliser.SnapshotCoeffs /
+  /// TKANNet.SnapshotAllCoeffs. The outer dimension of TKANCoeffSnapshot is
+  /// the per-network flat normaliser index (depth-first: layer 0 head 0 ..
+  /// layer 0 head H-1, layer 1 head 0, ...). Inner dimension is the knot
+  /// count of that head's grid.
+  TKANCoeffs = array of TNeuralFloat;
+  TKANCoeffSnapshot = array of TKANCoeffs;
+
   // ===================================================================
   //  SEEDED RNG  (spec §9)
   // ===================================================================

@@ -25,7 +25,7 @@ interface
 uses
   Classes, SysUtils, Math,
   neuralvolume, neuralnetwork, neuralfit, neuralthread, neuraldatasets,
-  neuralkanattention,
+  neuralkantypes, neuralkanattention,
   kantransformerdata;
 
 const
@@ -191,21 +191,47 @@ begin
 end;
 
 procedure TKANTransformerSession.LockAndGenerate;
+var
+  Snapshot: TKANCoeffSnapshot;
 begin
   // After this call, every TNNetKANNormaliser in FNN switches from
   // passthrough to its B-spline normaliser. LockToInference is one-way --
   // no further training is permitted on FNN.
   FNN.LockToInference;
   WriteLn('--- KAN attention engaged; post-training generation (baseline alpha=1.1): ---');
-  GenerateSamples;
+  // Inference-mode Compute mutates FHead.Coeffs on every forward pass
+  // (NLMS Phase M/D, see TNNetKANNormaliser.Compute step 7). Snapshot
+  // around generation so the loaded checkpoint is left untouched after
+  // this call -- LockAndGenerate is a pure read of the saved weights.
+  Snapshot := FNN.SnapshotAllCoeffs;
+  try
+    GenerateSamples;
+  finally
+    FNN.RestoreAllCoeffs(Snapshot);
+  end;
 end;
 
 procedure TKANTransformerSession.CalibrateAndGenerate(ValidationCount: integer);
+var
+  Snapshot: TKANCoeffSnapshot;
 begin
   WriteLn('--- Calibrating SharpenAlpha against validation loss ---');
+  // CalibrateAlpha defaults to PreserveCoeffs=true + UseBestAlpha=true:
+  // only the SharpenAlpha hyperparameter persists from the sweep, and
+  // the alpha selected is the one with the lowest observed validation
+  // loss across iterations.
   FNN.CalibrateAlpha(FDataset.GetValidationPair, ValidationCount);
   WriteLn('--- Post-calibration generation: ---');
-  GenerateSamples;
+  // Same non-destructive pattern as LockAndGenerate: the post-cal
+  // generation samples must not drift coefficients either, otherwise a
+  // subsequent inspection (or a re-run of CalibrateAndGenerate) would
+  // see a network that differs from the calibrated state.
+  Snapshot := FNN.SnapshotAllCoeffs;
+  try
+    GenerateSamples;
+  finally
+    FNN.RestoreAllCoeffs(Snapshot);
+  end;
 end;
 
 procedure TKANTransformerSession.GenerateSamples;
