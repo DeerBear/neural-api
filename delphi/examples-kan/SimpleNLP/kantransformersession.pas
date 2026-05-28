@@ -88,11 +88,19 @@ type
 
 implementation
 
-// Energy-conserving weight clipping. When a weight exceeds MaxAbs in
-// absolute value, clip it to ±MaxAbs and redistribute the excess
-// magnitude across the remaining weights in the same volume,
-// proportional to their current magnitude. Preserves the L1 norm
-// (sum of |w_i|) while bounding max(|w_i|) <= MaxAbs.
+// Energy-conserving weight clipping (L2). When a weight exceeds MaxAbs
+// in absolute value, clip it to ±MaxAbs and redistribute the excess
+// L2-energy (W_i^2 - MaxAbs^2) across the remaining weights in the same
+// volume, proportional to each weight's share of the unclipped subset's
+// energy (W_j^2 / Sum(W_k^2)). Preserves Sum(W_i^2) (the L2 energy of
+// the neuron) while bounding max(|w_i|) <= MaxAbs.
+//
+// The proportional-to-energy distribution is a uniform multiplicative
+// rescale of the unclipped subset:
+//   W_j := W_j * sqrt(1 + TotalExcessEnergy / UnclippedEnergy)
+// This preserves the L2 shape of the unclipped weights exactly --
+// relative ratios are unchanged, only the overall scale grows to
+// absorb the excess.
 //
 // The Mechanism-#1 design philosophy applied to network weights:
 // when a single channel tries to amplify, the optimizer can't drop
@@ -100,19 +108,24 @@ implementation
 // channels, which disrupts the positive-feedback runaway that broke
 // the v1.0 training at epoch 28.
 //
-// Single-pass: after redistribution some weights may slightly exceed
-// MaxAbs (bounded by their proportional share). Iterate-to-convergence
-// is a v1.1.1 refinement; this is the minimal correct implementation.
+// Degenerate-neuron handling: if the unclipped subset has zero energy
+// (e.g. all weights at the cap, or the rest are exactly zero), the
+// excess is dropped rather than redistributed. Conserving energy into
+// an already-collapsed neuron would just feed the runaway.
+//
+// Single-pass: after rescale some unclipped weights may exceed MaxAbs
+// (bounded by their proportional share of the bump). Iterate-to-
+// convergence is a v1.1.1 refinement; this is the minimal correct form.
 procedure ClipAndSpreadWeights(W: TNNetVolume; const MaxAbs: TNeuralFloat);
 var
   I: integer;
-  Weight, AbsWeight, Excess, TotalExcess, UnclippedL1, ScaleFactor: TNeuralFloat;
+  Weight, AbsWeight, TotalExcessEnergy, UnclippedEnergy, EnergyFactor: TNeuralFloat;
   IsClipped: array of boolean;
 begin
   if (W = nil) or (W.Size = 0) or (MaxAbs <= 0) then exit;
 
   SetLength(IsClipped, W.Size);
-  TotalExcess := 0;
+  TotalExcessEnergy := 0;
 
   for I := 0 to W.Size - 1 do
   begin
@@ -120,8 +133,8 @@ begin
     AbsWeight := Abs(Weight);
     if AbsWeight > MaxAbs then
     begin
-      Excess := AbsWeight - MaxAbs;
-      TotalExcess := TotalExcess + Excess;
+      // L2-energy of the clipped weight beyond the cap.
+      TotalExcessEnergy := TotalExcessEnergy + (AbsWeight*AbsWeight - MaxAbs*MaxAbs);
       if Weight > 0 then W.FData[I] := MaxAbs
       else W.FData[I] := -MaxAbs;
       IsClipped[I] := True;
@@ -130,27 +143,20 @@ begin
       IsClipped[I] := False;
   end;
 
-  if TotalExcess = 0 then exit;
+  if TotalExcessEnergy <= 0 then exit;
 
-  UnclippedL1 := 0;
+  UnclippedEnergy := 0;
   for I := 0 to W.Size - 1 do
     if not IsClipped[I] then
-      UnclippedL1 := UnclippedL1 + Abs(W.FData[I]);
+      UnclippedEnergy := UnclippedEnergy + W.FData[I]*W.FData[I];
 
-  // Degenerate cases: all weights clipped, or unclipped weights are zero.
-  // Leave clipped values in place; nowhere to spread the excess.
-  if UnclippedL1 <= 0 then exit;
+  // Degenerate case: nowhere to spread the excess. Drop it.
+  if UnclippedEnergy <= 0 then exit;
 
-  ScaleFactor := TotalExcess / UnclippedL1;
+  EnergyFactor := Sqrt(1 + TotalExcessEnergy / UnclippedEnergy);
   for I := 0 to W.Size - 1 do
     if not IsClipped[I] then
-    begin
-      Weight := W.FData[I];
-      if Weight > 0 then
-        W.FData[I] := Weight + Abs(Weight) * ScaleFactor
-      else if Weight < 0 then
-        W.FData[I] := Weight - Abs(Weight) * ScaleFactor;
-    end;
+      W.FData[I] := W.FData[I] * EnergyFactor;
 end;
 
 constructor TKANTransformerSession.Create(ANN: TKANNet;
