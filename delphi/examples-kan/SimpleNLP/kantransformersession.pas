@@ -43,6 +43,16 @@ const
   // headroom for legitimate learning. Tune for v1.1.
   csWeightClipMax: TNeuralFloat = 0.20;
 
+  // Looser threshold for Q/K/V projection layers in attention blocks.
+  // Attention dot products scale as Q*K, so capping Q/K at the same
+  // magnitude as the rest of the network (0.20) keeps softmax outputs
+  // near uniform 1/H = degenerate attention. The previous v1.1 run hit
+  // exactly this failure: Q/K weights settled around 0.11, dot products
+  // landed at 0.03-0.10, softmax outputs at 0.164-0.169 (uniform = 0.167).
+  // 0.40 gives the projections room to grow into a regime where dot
+  // products are meaningful (target: 0.5-2.0 range after MulByConstant).
+  csQKWeightClipMax: TNeuralFloat = 0.40;
+
 type
   TKANTransformerSession = class
   private
@@ -269,19 +279,42 @@ end;
 
 procedure TKANTransformerSession.OnAfterStep(Sender: TObject);
 var
-  LayerIdx, NeuronIdx: integer;
+  LayerIdx, NeuronIdx, AttIdx: integer;
   Layer: TNNetLayer;
+  Info: TKANAttentionLayerInfo;
+  QKVLayers: TList;
+  ClipMax: TNeuralFloat;
 begin
   // Apply energy-conserving weight clipping per-neuron across the entire
   // network after each batch. Per-neuron (rather than per-layer) preserves
   // the relative weight budgets between output channels; each channel's
   // weights spread among themselves but channels stay independent.
-  for LayerIdx := 0 to FNN.CountLayers - 1 do
-  begin
-    Layer := FNN.Layers[LayerIdx];
-    if Layer.Neurons.Count = 0 then continue;
-    for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
-      ClipAndSpreadWeights(Layer.Neurons[NeuronIdx].Weights, csWeightClipMax);
+  //
+  // Two thresholds: csQKWeightClipMax for Q/K/V projection layers in
+  // attention blocks (those need more dynamic range to produce non-trivial
+  // dot products), csWeightClipMax for everything else.
+  QKVLayers := TList.Create;
+  try
+    for AttIdx := 0 to FNN.AttentionLayers.Count - 1 do
+    begin
+      Info := TKANAttentionLayerInfo(FNN.AttentionLayers[AttIdx]);
+      if Info.QProjection <> nil then QKVLayers.Add(Info.QProjection);
+      if Info.KProjection <> nil then QKVLayers.Add(Info.KProjection);
+      if Info.VProjection <> nil then QKVLayers.Add(Info.VProjection);
+    end;
+
+    for LayerIdx := 0 to FNN.CountLayers - 1 do
+    begin
+      Layer := FNN.Layers[LayerIdx];
+      if Layer.Neurons.Count = 0 then continue;
+      if QKVLayers.IndexOf(Layer) >= 0
+        then ClipMax := csQKWeightClipMax
+        else ClipMax := csWeightClipMax;
+      for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+        ClipAndSpreadWeights(Layer.Neurons[NeuronIdx].Weights, ClipMax);
+    end;
+  finally
+    QKVLayers.Free;
   end;
 end;
 
