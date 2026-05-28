@@ -77,6 +77,13 @@ type
     FConsecutiveHighSweeps: integer;       // current run of sweeps above τ_squaring
 
     FNormalisers: TList;               // of TNNetKANNormaliser; length = H_max
+
+    // Q/K/V projection layer references. Captured at AddKANSelfAttention time
+    // so the session-level weight clipper can apply a looser threshold to
+    // attention projections than to feedforward layers. Without this the
+    // global clip ceiling (e.g. ±0.20) caps Q/K weights at a level where
+    // dot products stay near zero, yielding degenerate uniform attention.
+    FQProjection, FKProjection, FVProjection: TNNetLayer;
   public
     constructor Create(const AttentionLayerId: integer;
                        const Spec: TKANGridSpec;
@@ -89,6 +96,11 @@ type
     destructor Destroy; override;
 
     procedure RegisterNormaliser(const N: TNNetKANNormaliser);
+
+    /// Register the Q/K/V projection layer references created in
+    /// AddKANSelfAttention. Used by the session-level clipper to apply a
+    /// looser threshold to these specific layers.
+    procedure RegisterQKVProjections(const Q, K, V: TNNetLayer);
 
     /// Update the per-layer FClipRateEMA from the fraction of coefficients
     /// that fired clip-or-lift in the most recent mechanism-#1 sweep
@@ -121,6 +133,9 @@ type
     property TauSquaring: TNeuralFloat read FTauSquaring;
     property KSquaring: integer read FKSquaring;
     property Normalisers: TList read FNormalisers;
+    property QProjection: TNNetLayer read FQProjection;
+    property KProjection: TNNetLayer read FKProjection;
+    property VProjection: TNNetLayer read FVProjection;
   end;
 
   // ===================================================================
@@ -319,6 +334,13 @@ begin
   FNormalisers.Add(N);
 end;
 
+procedure TKANAttentionLayerInfo.RegisterQKVProjections(const Q, K, V: TNNetLayer);
+begin
+  FQProjection := Q;
+  FKProjection := K;
+  FVProjection := V;
+end;
+
 procedure TKANAttentionLayerInfo.RecordSweepClipRate(
   const SweepClipRate: TNeuralFloat);
 begin
@@ -488,9 +510,14 @@ begin
   FAttentionLayers.Add(Info);
 
   // (3) Q/K/V projections — mirror AddSelfAttention's no-HasNorm branch.
+  // Capture the projection layer references in Info before reassigning the
+  // *Group variables to the downstream SqrtRoot layers; the session-level
+  // clipper queries Info.QProjection/KProjection/VProjection to apply a
+  // looser weight clip to the attention projections.
   QueryGroup := AddLayerAfter([TNNetPointwiseConvLinear.Create(PreviousDepth, 1)], PreviousLayer);
   KeyGroup   := AddLayerAfter([TNNetPointwiseConvLinear.Create(PreviousDepth, 1)], PreviousLayer);
   ValueGroup := AddLayerAfter([TNNetPointwiseConvLinear.Create(PreviousDepth, 1)], PreviousLayer);
+  Info.RegisterQKVProjections(QueryGroup, KeyGroup, ValueGroup);
   QueryGroup := AddLayerAfter([TNNetSignedSquareRoot1.Create()], QueryGroup);
   KeyGroup   := AddLayerAfter([TNNetSignedSquareRoot1.Create()], KeyGroup);
   ValueGroup := AddLayerAfter([TNNetSignedSquareRoot1.Create()], ValueGroup);
