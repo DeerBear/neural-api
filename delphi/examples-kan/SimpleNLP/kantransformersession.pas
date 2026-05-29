@@ -159,6 +159,61 @@ begin
       W.FData[I] := W.FData[I] * EnergyFactor;
 end;
 
+// Diagnostic: dump max|W|, std|W|, and "% of weights pinned at the cap"
+// for one layer. Computed across every weight in every neuron of the
+// layer -- one line of output per call. The three numbers together
+// distinguish:
+//   * Healthy:        max < cap, std non-trivial, pinned% ~ 0
+//   * Stuck small:    max << cap, std small, pinned% = 0
+//   * Saturating:     max == cap, std non-trivial, pinned% low but rising
+//   * Homogenized:    max == cap, std collapsing, pinned% climbing -> 100
+// The collapse signature we're hunting is "homogenized" -- specifically
+// std collapsing while pinned% rises, indicating weights migrating into
+// the clipped subset and being held there by the clipper.
+procedure DumpLayerWeightStats(Layer: TNNetLayer; const LayerName: string;
+  const ClipMax: TNeuralFloat);
+var
+  NeuronIdx, I, Count, PinnedCount: integer;
+  W: TNNetVolume;
+  AbsW, MaxAbs, SumAbs, SumSquared, Mean, Variance, Stddev,
+    CapThreshold: TNeuralFloat;
+begin
+  if Layer = nil then exit;
+  MaxAbs := 0;
+  SumAbs := 0;
+  SumSquared := 0;
+  Count := 0;
+  PinnedCount := 0;
+  CapThreshold := ClipMax * 0.99;
+
+  for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+  begin
+    W := Layer.Neurons[NeuronIdx].Weights;
+    if W = nil then continue;
+    for I := 0 to W.Size - 1 do
+    begin
+      AbsW := Abs(W.FData[I]);
+      if AbsW > MaxAbs then MaxAbs := AbsW;
+      SumAbs := SumAbs + AbsW;
+      SumSquared := SumSquared + AbsW * AbsW;
+      Inc(Count);
+      if AbsW >= CapThreshold then Inc(PinnedCount);
+    end;
+  end;
+
+  if Count = 0 then exit;
+
+  Mean := SumAbs / Count;
+  Variance := SumSquared / Count - Mean * Mean;
+  if Variance < 0 then Variance := 0;
+  Stddev := Sqrt(Variance);
+
+  WriteLn(Format(
+    '  [W] %s max=%.4f mean=%.4f std=%.4f pinned=%d/%d (%.1f%%)',
+    [LayerName, MaxAbs, Mean, Stddev, PinnedCount, Count,
+     100.0 * PinnedCount / Count]));
+end;
+
 constructor TKANTransformerSession.Create(ANN: TKANNet;
   ADataset: TKANTransformerDataset);
 begin
@@ -290,6 +345,7 @@ var
   Info: TKANAttentionLayerInfo;
   QKVLayers: TList;
   ClipMax: TNeuralFloat;
+  ShouldDumpStats: boolean;
 begin
   // Apply energy-conserving weight clipping per-neuron across the entire
   // network after each batch. Per-neuron (rather than per-layer) preserves
@@ -318,6 +374,28 @@ begin
         else ClipMax := csWeightClipMax;
       for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
         ClipAndSpreadWeights(Layer.Neurons[NeuronIdx].Weights, ClipMax);
+    end;
+
+    // Diagnostic dump at the same cadence as the training log. Lets weight
+    // evolution be correlated with accuracy across the run. Tracks the
+    // peak-then-collapse hypothesis: if homogenization-via-migration is
+    // happening, std|W| collapses toward 0 and pinned% climbs toward 100
+    // for Q/K projections in the collapse window. If something else is
+    // driving the collapse, these stay healthy and we look elsewhere.
+    ShouldDumpStats := (Sender = FNFit) and (FNFit.LogEveryBatches > 0)
+      and ((FNFit.CurrentStep + 1) mod FNFit.LogEveryBatches = 0);
+    if ShouldDumpStats then
+    begin
+      for AttIdx := 0 to FNN.AttentionLayers.Count - 1 do
+      begin
+        Info := TKANAttentionLayerInfo(FNN.AttentionLayers[AttIdx]);
+        if Info.QProjection <> nil then
+          DumpLayerWeightStats(Info.QProjection,
+            Format('Att%d.Q', [AttIdx]), csQKWeightClipMax);
+        if Info.KProjection <> nil then
+          DumpLayerWeightStats(Info.KProjection,
+            Format('Att%d.K', [AttIdx]), csQKWeightClipMax);
+      end;
     end;
   finally
     QKVLayers.Free;
