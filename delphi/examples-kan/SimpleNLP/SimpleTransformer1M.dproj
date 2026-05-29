@@ -184,7 +184,6 @@
         <DCCReference Include="..\..\neural\neuralfit.pas"/>
         <DCCReference Include="..\..\neural\neuraldatasets.pas"/>
         <DCCReference Include="..\..\neural\neuralthread.pas"/>
-        <DCCReference Include="..\..\examples\CustApp.pas"/>
         <DCCReference Include="..\..\neural\neuralab.pas"/>
         <DCCReference Include="..\..\neural\neuralabfun.pas"/>
         <DCCReference Include="..\..\neural\neuralbit.pas"/>
@@ -196,6 +195,9 @@
         <DCCReference Include="..\..\neural\neuralkanbasis.pas"/>
         <DCCReference Include="..\..\neural\neuralkannormaliser.pas"/>
         <DCCReference Include="..\..\neural\neuralkanattention.pas"/>
+        <DCCReference Include="kantransformerarch.pas"/>
+        <DCCReference Include="kantransformerdata.pas"/>
+        <DCCReference Include="kantransformersession.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

@@ -34,7 +34,7 @@ Identical to the base SimpleTransformer except:
 Paired with delphi/examples/SimpleNLP/SimpleTransformer.lpr (the softmax-
 attention baseline) for a single-architectural-variable A/B comparison.
 
-Copyright (C) 2026 Andrea Raimondi
+Copyright (C) 2023 Joao Paulo Schwarz Schuler
 *)
 
 uses
