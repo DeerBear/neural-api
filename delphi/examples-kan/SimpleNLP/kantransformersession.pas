@@ -596,6 +596,17 @@ begin
           FLastQKStats[QKSlot + 1] := Stats;
           FLastQKLayerNames[QKSlot + 1] := LayerName;
         end;
+        // V is printed for visibility only; it does not feed the adaptive
+        // trigger evaluator. The homogenization / saturation signatures
+        // are properties of Q/K (which drive softmax sharpness), not V
+        // (which carries the actual content vectors). Cap reference is the
+        // same Q/K/V cap used by the clipper.
+        if Info.VProjection <> nil then
+        begin
+          LayerName := Format('Att%d.V', [AttIdx]);
+          Stats := ComputeLayerWeightStats(Info.VProjection, FQKClipMax);
+          PrintLayerWeightStats(LayerName, Stats);
+        end;
       end;
 
       // Ring-buffer the current training accuracy for the
