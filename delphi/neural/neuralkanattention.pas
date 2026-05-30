@@ -124,6 +124,18 @@ type
     /// active heads — is still a stub.)
     procedure CheckSquaring;
 
+    /// Plateau-triggered ActiveHeads doubling (training-mode head growth,
+    /// separate from spec §5.4 squaring which is clip-rate-EMA driven).
+    /// Doubles FActiveHeads up to FHMax. No-op if already at HMax.
+    /// Returns true if a doubling actually happened.
+    function DoubleActiveHeads: boolean;
+
+    /// Raw pointer to FActiveHeads. Stored by each TNNetKANNormaliser at
+    /// construction time so the normaliser can check on every forward /
+    /// backward pass whether its FHeadIndex is still within the active
+    /// range. Pointer is stable for the lifetime of the Info object.
+    function ActiveHeadsRef: PInteger;
+
     property AttentionLayerId: integer read FAttentionLayerId;
     property Basis: TKANBasis read FBasis;
     property HMax: integer read FHMax;
@@ -376,6 +388,26 @@ begin
   end;
 end;
 
+function TKANAttentionLayerInfo.DoubleActiveHeads: boolean;
+var
+  NewActive: integer;
+begin
+  Result := false;
+  if FActiveHeads >= FHMax then exit;
+  NewActive := FActiveHeads * 2;
+  if NewActive > FHMax then NewActive := FHMax;
+  if NewActive > FActiveHeads then
+  begin
+    FActiveHeads := NewActive;
+    Result := true;
+  end;
+end;
+
+function TKANAttentionLayerInfo.ActiveHeadsRef: PInteger;
+begin
+  Result := @FActiveHeads;
+end;
+
 // =====================================================================
 //  TKANNet
 // =====================================================================
@@ -552,6 +584,9 @@ begin
     Normaliser.SharpenAlpha := SharpenAlpha;
     Normaliser.KLThreshold := KLThreshold;
     Normaliser.KLConfirmPasses := KLConfirmPasses;
+    // Wire the inactive-head gate. HeadCnt >= Info.ActiveHeads triggers
+    // ZeroOutputForInactive on forward and skips backward.
+    Normaliser.SetActiveHeadsRef(Info.ActiveHeadsRef);
     NormaliserLayer := AddLayer(Normaliser);
     Info.RegisterNormaliser(Normaliser);
 
