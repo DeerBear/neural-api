@@ -63,7 +63,7 @@ uses
 
 const
   csTrainingFileName = 'datasets/tinystories.txt';
-  csDefaultRandSeed = 42;
+  csDefaultRandSeed = 1337;
 
 var
   Dataset: TKANTransformerDataset;

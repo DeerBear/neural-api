@@ -53,6 +53,15 @@ const
   // products are meaningful (target: 0.5-2.0 range after MulByConstant).
   csQKWeightClipMax: TNeuralFloat = 0.40;
 
+  // Override for TNeuralDataLoadingFit.MaxThreadNum. Without this set,
+  // the framework picks NeuralDefaultThreadCount() == TThread.ProcessorCount
+  // (4 on the reference 4-thread non-AVX i5). Bumping to 6 gives 1.5x
+  // oversubscription -- the OS scheduler handles it, framework does not
+  // cap MaxThreadNum, and memory cost is one extra TNet clone (~5.5 MB).
+  // Tunable for different host machines; revert to 4 to match the default
+  // exactly, or push higher (8, 12...) on bigger CPUs.
+  csTrainingThreadCount: integer = 6;
+
   // Adaptive controller (epoch-boundary triggers + adjustments).
   //
   // At every epoch boundary past the first, the session inspects:
@@ -375,6 +384,9 @@ begin
   FNFit.EnableClassComparison();
   FNFit.EnableDefaultLoss();
   FNFit.AvgWeightEpochCount := 1;
+  // Override the framework's auto-detected thread count. See
+  // csTrainingThreadCount in the const block above for rationale.
+  FNFit.MaxThreadNum := csTrainingThreadCount;
   FNFit.OnAfterEpoch := OnAfterEpoch;
   FNFit.OnAfterStep := OnAfterStep;
   FNFit.FitLoading(
