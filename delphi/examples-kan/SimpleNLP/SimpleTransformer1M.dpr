@@ -63,13 +63,27 @@ uses
 
 const
   csTrainingFileName = 'datasets/tinystories.txt';
+  csDefaultRandSeed = 1337;
 
 var
   Dataset: TKANTransformerDataset;
   Net: TKANNet;
   Session: TKANTransformerSession;
   ValidationCount: integer;
+  Seed: integer;
 begin
+  // Force-seed the global RNG. neural-api initialises weights via Pascal's
+  // global Random(); without an explicit RandSeed the framework calls
+  // Randomize() and the run becomes irreproducible -- which made comparing
+  // two training runs of the KAN architecture impossible to attribute
+  // (init variance vs code variance). Override with an integer first arg.
+  if ParamCount >= 1 then
+    Seed := StrToIntDef(ParamStr(1), csDefaultRandSeed)
+  else
+    Seed := csDefaultRandSeed;
+  RandSeed := Seed;
+  WriteLn('Using RandSeed=', Seed);
+
   Dataset := TKANTransformerDataset.Create(csTrainingFileName, csContextLen);
   try
     Dataset.LoadDataset;

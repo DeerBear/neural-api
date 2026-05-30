@@ -53,6 +53,15 @@ const
   // products are meaningful (target: 0.5-2.0 range after MulByConstant).
   csQKWeightClipMax: TNeuralFloat = 0.40;
 
+  // Override for TNeuralDataLoadingFit.MaxThreadNum. Without this set,
+  // the framework picks NeuralDefaultThreadCount() == TThread.ProcessorCount
+  // (4 on the reference 4-thread non-AVX i5). Bumping to 6 gives 1.5x
+  // oversubscription -- the OS scheduler handles it, framework does not
+  // cap MaxThreadNum, and memory cost is one extra TNet clone (~5.5 MB).
+  // Tunable for different host machines; revert to 4 to match the default
+  // exactly, or push higher (8, 12...) on bigger CPUs.
+  csTrainingThreadCount: integer = 6;
+
   // Adaptive controller (epoch-boundary triggers + adjustments).
   //
   // At every epoch boundary past the first, the session inspects:
@@ -95,11 +104,22 @@ type
   // Snapshot of a layer's weight distribution at one moment in time.
   // Returned by ComputeLayerWeightStats; consumed by the adaptive
   // controller's adjustment selector at the epoch boundary.
+  //
+  // L2: sqrt(Sum(W_i^2)). The full-energy invariant the clipper
+  //   preserves. Drifts even when max/mean/std are frozen at 4dp,
+  //   because rearrangement among individual weights changes it.
+  // ActMax / ActMin: max(|out|) and signed min(out) of the layer's
+  //   FOutput right after the most recent forward pass. Tells us
+  //   what magnitudes the layer is producing, not just what
+  //   magnitudes the weights have.
   TLayerWeightStats = record
     MaxAbs: TNeuralFloat;
     Mean: TNeuralFloat;
     Stddev: TNeuralFloat;
     PinnedPct: TNeuralFloat;  // [0, 100]
+    L2: TNeuralFloat;
+    ActMax: TNeuralFloat;
+    ActMin: TNeuralFloat;
     Count: integer;
   end;
 
@@ -269,6 +289,9 @@ begin
   Result.Mean := 0;
   Result.Stddev := 0;
   Result.PinnedPct := 0;
+  Result.L2 := 0;
+  Result.ActMax := 0;
+  Result.ActMin := 0;
   Result.Count := 0;
   if Layer = nil then exit;
 
@@ -299,6 +322,18 @@ begin
   if Variance < 0 then Variance := 0;
   Result.Stddev := Sqrt(Variance);
   Result.PinnedPct := 100.0 * PinnedCount / Result.Count;
+  Result.L2 := Sqrt(SumSquared);
+
+  // Activation magnitudes from the layer's FOutput (snapshot from the
+  // most recent forward pass). Useful for spotting saturation, dead
+  // ReLUs, and runaway activations that wouldn't show up in weight
+  // stats. Layer.Output is non-nil for every layer with FOutput set up;
+  // we still guard against an empty volume defensively.
+  if (Layer.Output <> nil) and (Layer.Output.Size > 0) then
+  begin
+    Result.ActMax := Layer.Output.GetMaxAbs();
+    Result.ActMin := Layer.Output.GetMin();
+  end;
 end;
 
 procedure PrintLayerWeightStats(const LayerName: string;
@@ -306,9 +341,9 @@ procedure PrintLayerWeightStats(const LayerName: string;
 begin
   if Stats.Count = 0 then exit;
   WriteLn(Format(
-    '  [W] %s max=%.4f mean=%.4f std=%.4f pinned=%.1f%% (count=%d)',
-    [LayerName, Stats.MaxAbs, Stats.Mean, Stats.Stddev,
-     Stats.PinnedPct, Stats.Count]));
+    '  [W] %-14s w max=%.4f mean=%.4f std=%.4f L2=%.3f pin=%.1f%% out |max|=%.4f min=%.4f',
+    [LayerName, Stats.MaxAbs, Stats.Mean, Stats.Stddev, Stats.L2,
+     Stats.PinnedPct, Stats.ActMax, Stats.ActMin]));
 end;
 
 constructor TKANTransformerSession.Create(ANN: TKANNet;
@@ -349,6 +384,9 @@ begin
   FNFit.EnableClassComparison();
   FNFit.EnableDefaultLoss();
   FNFit.AvgWeightEpochCount := 1;
+  // Override the framework's auto-detected thread count. See
+  // csTrainingThreadCount in the const block above for rationale.
+  FNFit.MaxThreadNum := csTrainingThreadCount;
   FNFit.OnAfterEpoch := OnAfterEpoch;
   FNFit.OnAfterStep := OnAfterStep;
   FNFit.FitLoading(
@@ -607,6 +645,23 @@ begin
           Stats := ComputeLayerWeightStats(Info.VProjection, FQKClipMax);
           PrintLayerWeightStats(LayerName, Stats);
         end;
+      end;
+
+      // Dump every other neuron-bearing layer too. Catches movement in
+      // the FFN, embedding-feeder convs, attention output projections,
+      // and the final FC stack -- the layers we couldn't see before
+      // and which (if "FFN+V learns first" is right) are doing most of
+      // the actual learning while Q/K stays inert. Skip layers already
+      // dumped above (the Q/K/V triples). Cap reference for non-Q/K/V
+      // is csWeightClipMax (the tighter 0.20 cap).
+      for LayerIdx := 0 to FNN.CountLayers - 1 do
+      begin
+        Layer := FNN.Layers[LayerIdx];
+        if Layer.Neurons.Count = 0 then continue;
+        if QKVLayers.IndexOf(Layer) >= 0 then continue;
+        LayerName := Format('L%-3d %s', [LayerIdx, Layer.ClassName]);
+        Stats := ComputeLayerWeightStats(Layer, csWeightClipMax);
+        PrintLayerWeightStats(LayerName, Stats);
       end;
 
       // Ring-buffer the current training accuracy for the
