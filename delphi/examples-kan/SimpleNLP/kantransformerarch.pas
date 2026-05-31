@@ -39,10 +39,14 @@ const
 
   // Transformer block geometry
   csTransformerBlocks = 2;
-  csHeads             = 16;      // Active heads per attention block; the
-                                 // ceiling is the same in v1 since head
-                                 // squaring (S4) is not yet implemented.
-  csHeadCeiling       = 16;
+  // Initial active head count per attention block. Architecture builds
+  // csHeadCeiling head slots; csHeads of them are active at start, the
+  // rest produce zero output via TNNetKANNormaliser's inactive-head
+  // gate. Plateau-triggered doubling at the session level grows
+  // ActiveHeads (8 -> 16 -> 32 -> 64) until it hits csHeadCeiling.
+  // Per-head dim = csEmbeddingDim div csHeadCeiling (currently 256/64=4).
+  csHeads             = 8;
+  csHeadCeiling       = 64;
   csFFNIntermediate   = 512;     // PointwiseConvReLU expand size
 
   // Output head

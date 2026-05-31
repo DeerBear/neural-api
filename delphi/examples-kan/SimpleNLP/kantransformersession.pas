@@ -100,6 +100,15 @@ const
   // accuracy-oscillation diagnostic.
   csAccuracyHistorySize: integer = 16;
 
+  // Plateau-triggered ActiveHeads doubling. The architecture builds
+  // csHeadCeiling head slots (currently 64) and starts with csHeads
+  // active (currently 8). When validation loss fails to improve for
+  // csHeadDoubleWindow consecutive epochs, ActiveHeads doubles
+  // (8 -> 16 -> 32 -> 64) on every attention layer. Independent of the
+  // longer csPlateauWindow (10) that triggers training stop -- doubling
+  // is a corrective response, stopping is a termination response.
+  csHeadDoubleWindow: integer = 2;
+
 type
   // Snapshot of a layer's weight distribution at one moment in time.
   // Returned by ComputeLayerWeightStats; consumed by the adaptive
@@ -145,6 +154,14 @@ type
     FQKClipMax: TNeuralFloat;
     FMigrationCapEnabled: boolean;
 
+    // Plateau-triggered head doubling. Tracks best ValidationLoss
+    // independently of FBestLoss/FBestLossEpoch (which feed the
+    // separate, longer stop-condition plateau). FHeadDoubleBestEpoch
+    // is reset every time ActiveHeads is bumped so the next doubling
+    // is gated by csHeadDoubleWindow fresh epochs of no improvement.
+    FHeadDoubleBestLoss: TNeuralFloat;
+    FHeadDoubleBestEpoch: integer;
+
     // Per-epoch trackers, reset at OnAfterEpoch. FAccuracyHistory is a
     // ring buffer of TrainingAccuracy sampled at each log boundary;
     // FLastQKStats holds the most recent Q/K stats so the trigger
@@ -158,6 +175,10 @@ type
     procedure OnAfterEpoch(Sender: TObject);
     procedure OnAfterStep(Sender: TObject);
     procedure GenerateSamples;
+    /// Iterate FNN.AttentionLayers, call DoubleActiveHeads on each, and
+    /// log a single summary line. Invoked from OnAfterEpoch when the
+    /// head-double plateau condition fires.
+    procedure MaybeDoubleAllActiveHeads;
   public
     constructor Create(ANN: TKANNet; ADataset: TKANTransformerDataset);
     destructor Destroy; override;
@@ -340,10 +361,15 @@ procedure PrintLayerWeightStats(const LayerName: string;
   const Stats: TLayerWeightStats);
 begin
   if Stats.Count = 0 then exit;
+  // Activation columns (out |max|, out min) intentionally not printed:
+  // the framework uses TNNetDataParallelism, so each thread does its
+  // forward pass into a clone's FOutput. The main FNN we have a handle
+  // to never sees populated activations -- they'd always read 0.0000.
+  // Weight stats sync back to FNN after each batch and are correct.
   WriteLn(Format(
-    '  [W] %-14s w max=%.4f mean=%.4f std=%.4f L2=%.3f pin=%.1f%% out |max|=%.4f min=%.4f',
+    '  [W] %-14s w max=%.4f mean=%.4f std=%.4f L2=%.3f pin=%.1f%%',
     [LayerName, Stats.MaxAbs, Stats.Mean, Stats.Stddev, Stats.L2,
-     Stats.PinnedPct, Stats.ActMax, Stats.ActMin]));
+     Stats.PinnedPct]));
 end;
 
 constructor TKANTransformerSession.Create(ANN: TKANNet;
@@ -360,6 +386,8 @@ begin
 
   FQKClipMax := csQKWeightClipMax;
   FMigrationCapEnabled := false;
+  FHeadDoubleBestLoss := 1e30;
+  FHeadDoubleBestEpoch := 0;
   SetLength(FAccuracyHistory, csAccuracyHistorySize);
   FAccuracyHistoryIdx := 0;
   FAccuracyHistoryCount := 0;
@@ -457,6 +485,39 @@ begin
   WriteLn(GenerateStringFromChars(FNN, 'billy ', FSampler), '.');
 end;
 
+procedure TKANTransformerSession.MaybeDoubleAllActiveHeads;
+var
+  I, BeforeActive, AfterActive, HMax: integer;
+  Info: TKANAttentionLayerInfo;
+  Doubled: boolean;
+  Summary: string;
+begin
+  Doubled := false;
+  Summary := '';
+  for I := 0 to FNN.AttentionLayers.Count - 1 do
+  begin
+    Info := TKANAttentionLayerInfo(FNN.AttentionLayers[I]);
+    BeforeActive := Info.ActiveHeads;
+    HMax := Info.HMax;
+    if Info.DoubleActiveHeads then
+    begin
+      Doubled := true;
+      AfterActive := Info.ActiveHeads;
+      Summary := Summary + Format(' L%d:%d->%d', [I, BeforeActive, AfterActive]);
+    end
+    else
+      Summary := Summary + Format(' L%d:%d(cap=%d)', [I, BeforeActive, HMax]);
+  end;
+  if Doubled then
+    WriteLn(Format(
+      '[Adaptive] Plateau %d epochs without ValidationLoss improvement; doubled ActiveHeads:%s',
+      [csHeadDoubleWindow, Summary]))
+  else
+    WriteLn(Format(
+      '[Adaptive] Plateau %d epochs without ValidationLoss improvement; ActiveHeads already at HMax on all layers (%s).',
+      [csHeadDoubleWindow, Summary]));
+end;
+
 procedure TKANTransformerSession.OnAfterEpoch(Sender: TObject);
 var
   I: integer;
@@ -481,6 +542,23 @@ begin
         'Plateau: no ValidationLoss improvement for %d epochs (best %.4f at epoch %d). Stopping.',
         [FPlateauWindow, FBestLoss, FBestLossEpoch]));
       FNFit.ShouldQuit := true;
+    end;
+
+    // Plateau-triggered head doubling. Tracked on a separate, shorter
+    // window than the stop-condition plateau above. When
+    // csHeadDoubleWindow epochs pass with no validation-loss
+    // improvement, every attention layer doubles its ActiveHeads (up
+    // to its HMax). The doubling resets the head-double-plateau
+    // counter; the stop plateau counter is unaffected.
+    if FNFit.ValidationLoss < FHeadDoubleBestLoss then
+    begin
+      FHeadDoubleBestLoss := FNFit.ValidationLoss;
+      FHeadDoubleBestEpoch := FNFit.CurrentEpoch;
+    end
+    else if (FNFit.CurrentEpoch - FHeadDoubleBestEpoch) >= csHeadDoubleWindow then
+    begin
+      MaybeDoubleAllActiveHeads;
+      FHeadDoubleBestEpoch := FNFit.CurrentEpoch;
     end;
 
     // Adaptive controller. Past epoch 1 only (initial-fit dynamics

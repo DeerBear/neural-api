@@ -90,6 +90,12 @@ type
     // --- Shared resources (owned by TKANAttentionLayerInfo) ---
     FBasis: TKANBasis;
     FRNG: PKANSeededRNG;
+    // Raw pointer to the owning Info.FActiveHeads. nil until
+    // SetActiveHeadsRef is called by AddKANSelfAttention. When non-nil
+    // and FHeadIndex >= FActiveHeadsRef^, Compute writes zeros into
+    // FOutput (via ZeroOutputForInactive) and Backpropagate becomes a
+    // no-op, so the head contributes nothing to forward or backward.
+    FActiveHeadsRef: PInteger;
 
     // --- Per-head mutable state ---
     FHead: TKANHeadState;
@@ -181,6 +187,16 @@ type
     /// match Length(FHead.Coeffs); raises EKANBadState otherwise.
     procedure RestoreCoeffs(const Source: TKANCoeffs);
 
+    /// Store the raw pointer to the owning Info's FActiveHeads field.
+    /// Called once by AddKANSelfAttention immediately after construction.
+    /// Pointer remains valid for the lifetime of this normaliser (which
+    /// is shorter than the Info's lifetime by construction).
+    procedure SetActiveHeadsRef(const P: PInteger);
+
+    /// True if this head is currently outside the active range. When
+    /// true, Compute zeros the output and Backpropagate is a no-op.
+    function IsInactive: boolean;
+
     // --- Telemetry (spec §14.5) ---
     property HeadIndex: integer read FHeadIndex;
     property AttentionLayerId: integer read FAttentionLayerId;
@@ -223,6 +239,7 @@ begin
   FBasis := SharedBasis;
   FRNG := SharedRNG;
   FGridSpec := GridSpec;
+  FActiveHeadsRef := nil;  // wired by AddKANSelfAttention after construction
 
   // Defaults (spec §11)
   FHighClipShare := ksrAuto;
@@ -259,8 +276,19 @@ begin
   inherited Create;
   FBasis := nil;
   FRNG := nil;
+  FActiveHeadsRef := nil;
   FInferenceMode := false;
   FKANEnabled := false;
+end;
+
+procedure TNNetKANNormaliser.SetActiveHeadsRef(const P: PInteger);
+begin
+  FActiveHeadsRef := P;
+end;
+
+function TNNetKANNormaliser.IsInactive: boolean;
+begin
+  Result := (FActiveHeadsRef <> nil) and (FHeadIndex >= FActiveHeadsRef^);
 end;
 
 destructor TNNetKANNormaliser.Destroy;
@@ -312,6 +340,16 @@ var
   KLPassSum, KLPass: TNeuralFloat;
   LayerClipRate: TNeuralFloat;
 begin
+  // Inactive-head gate (training and inference). When this head's index
+  // is outside the current active range -- e.g. heads 8..63 when
+  // ActiveHeads=8 -- zero the output so the downstream DotProducts and
+  // DeepConcat see no contribution from this head.
+  if IsInactive then
+  begin
+    ZeroOutputForInactive;
+    exit;
+  end;
+
   if (not FInferenceMode) or (not FKANEnabled) then
   begin
     // Fallback: pure identity passthrough. inherited Compute (TNNetIdentity)
@@ -398,6 +436,12 @@ begin
   if FInferenceMode then
     raise EKANInInference.Create(
       'Backpropagate called on KAN normaliser layer in inference mode');
+
+  // Inactive heads do not propagate gradient. Forward zeroed our
+  // FOutput so no useful signal exists to send back; skipping
+  // inherited Backpropagate prevents this head's Q/K/V slice from
+  // receiving spurious weight updates.
+  if IsInactive then exit;
 
   // Fallback: pure identity passthrough. inherited Backpropagate (from
   // TNNetIdentity) accumulates FOutputError into FPrevLayer.FOutputError
