@@ -49,6 +49,8 @@ uses
   neuralkanattention in '..\..\neural\neuralkanattention.pas',
   kantransformerarch in 'kantransformerarch.pas',
   kantransformerdata in 'kantransformerdata.pas',
+  kanmmapdataset in 'kanmmapdataset.pas',
+  kanprefetch in 'kanprefetch.pas',
   kantransformersession in 'kantransformersession.pas';
 
 const

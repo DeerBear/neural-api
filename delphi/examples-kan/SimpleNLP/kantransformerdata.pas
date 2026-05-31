@@ -62,6 +62,9 @@ type
     procedure GetTestPair(Idx: integer; ThreadId: integer;
       pInput, pOutput: TNNetVolume);
     property DatasetSize: integer read FDatasetSize;
+    // Source file path, so a memory-mapped training source can be built from
+    // the same corpus the eager loader read.
+    property FileName: string read FFileName;
     // Curriculum window for training samples: pair-getter caps the sample
     // length by this value. OnAfterEpoch typically grows/shrinks this in
     // response to training accuracy.

@@ -1495,7 +1495,11 @@ begin
   {$ENDIF}
   FCurrentEpoch := FInitialEpoch;
   FCurrentLearningRate := FInitialLearningRate;
-  FThreadNum := Min(FMaxThreadNum, FDefaultThreadCount);
+  // Honour an explicit MaxThreadNum, including deliberate oversubscription
+  // above the detected core count (e.g. to hide mmap page-fault latency).
+  // Previously Min(FMaxThreadNum, FDefaultThreadCount) clamped any value
+  // above the constructor-detected default, so the count could only go down.
+  FThreadNum := FMaxThreadNum;
   FBatchSize := pBatchSize;
   if FBatchSize >= FThreadNum then
   begin
@@ -2047,7 +2051,11 @@ begin
       LocalHasValidation := True;
     end;
   end;
-  FThreadNum := Min(FMaxThreadNum, FDefaultThreadCount);
+  // Honour an explicit MaxThreadNum, including deliberate oversubscription
+  // above the detected core count (e.g. to hide mmap page-fault latency).
+  // Previously Min(FMaxThreadNum, FDefaultThreadCount) clamped any value
+  // above the constructor-detected default, so the count could only go down.
+  FThreadNum := FMaxThreadNum;
   FBatchSize := pBatchSize;
   FMaxEpochs := Epochs;
   if FBatchSize >= FThreadNum then

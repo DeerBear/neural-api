@@ -26,7 +26,7 @@ uses
   Classes, SysUtils, Math,
   neuralvolume, neuralnetwork, neuralfit, neuralthread, neuraldatasets,
   neuralkantypes, neuralkanattention,
-  kantransformerdata;
+  kantransformerdata, kanmmapdataset, kanprefetch;
 
 const
   // Energy-conserving per-neuron weight clipping threshold. Per-neuron
@@ -138,6 +138,16 @@ type
     FDataset: TKANTransformerDataset;
     FNFit: TNeuralDataLoadingFit;
     FSampler: TNNetSamplerBase;
+
+    // Memory-mapped training source + async prefetch -- the "load once, work
+    // downstream" experiment. FUseMmapTraining routes the training hot loop
+    // through the mmap loader; FUsePrefetch additionally decouples sample prep
+    // onto a background loader thread. Validation/test stay on the eager
+    // FDataset. Both default on; flip them (and MaxThreadNum) for the A/B.
+    FMapped: TKANMappedDataset;
+    FPrefetcher: TKANPrefetcher;
+    FUseMmapTraining: boolean;
+    FUsePrefetch: boolean;
     // Plateau-based early stopping: track best ValidationLoss and the
     // epoch it was achieved. If FPlateauWindow epochs pass without a
     // new record, the run is treated as converged and ShouldQuit is
@@ -179,6 +189,10 @@ type
     /// log a single summary line. Invoked from OnAfterEpoch when the
     /// head-double plateau condition fires.
     procedure MaybeDoubleAllActiveHeads;
+    /// Training hot-loop getter. Routes to the prefetcher, the direct mmap
+    /// loader, or the eager dataset depending on the FUse* flags.
+    procedure GetTrainingPairRouted(Idx, ThreadId: integer;
+      pInput, pOutput: TNNetVolume);
   public
     constructor Create(ANN: TKANNet; ADataset: TKANTransformerDataset);
     destructor Destroy; override;
@@ -193,6 +207,16 @@ type
     procedure CalibrateAndGenerate(ValidationCount: integer);
     property PlateauWindow: integer
       read FPlateauWindow write FPlateauWindow;
+    // Route training through the mmap loader (default true). When false, the
+    // eager FDataset.GetTrainingPair is used -- the baseline arm of the A/B.
+    property UseMmapTraining: boolean
+      read FUseMmapTraining write FUseMmapTraining;
+    // Decouple sample prep onto a background loader thread (default true).
+    // With this on, the page faults live in the loader, so keep compute
+    // threads at core count. With it off (workers read the mmap directly),
+    // the workers fault -- that's the over-subscribe-the-workers arm.
+    property UsePrefetch: boolean
+      read FUsePrefetch write FUsePrefetch;
   end;
 
 implementation
@@ -384,6 +408,11 @@ begin
   FBestLossEpoch := 0;
   FPlateauWindow := 10;
 
+  FMapped := nil;
+  FPrefetcher := nil;
+  FUseMmapTraining := true;
+  FUsePrefetch := true;
+
   FQKClipMax := csQKWeightClipMax;
   FMigrationCapEnabled := false;
   FHeadDoubleBestLoss := 1e30;
@@ -396,9 +425,32 @@ end;
 
 destructor TKANTransformerSession.Destroy;
 begin
+  // Defensive: Train frees these in its finally block, but tear them down
+  // here too in case Train was never called or raised before cleanup.
+  if Assigned(FPrefetcher) then
+  begin
+    FPrefetcher.Stop;
+    FreeAndNil(FPrefetcher);
+  end;
+  FreeAndNil(FMapped);
   FSampler.Free;
   FNFit.Free;
   inherited Destroy;
+end;
+
+procedure TKANTransformerSession.GetTrainingPairRouted(Idx, ThreadId: integer;
+  pInput, pOutput: TNNetVolume);
+begin
+  // With prefetch on, pop a sample the background loader already built from
+  // the mmap (workers stay CPU-bound, faults live in the loader). With it
+  // off but mmap on, read the mapping directly (workers fault -- the
+  // oversubscription-hiding arm). Otherwise fall back to the eager dataset.
+  if FUsePrefetch and Assigned(FPrefetcher) then
+    FPrefetcher.GetPair(pInput, pOutput)
+  else if FUseMmapTraining and Assigned(FMapped) then
+    FMapped.BuildTrainingSample(pInput, pOutput)
+  else
+    FDataset.GetTrainingPair(Idx, ThreadId, pInput, pOutput);
 end;
 
 procedure TKANTransformerSession.Train(TrainingCount, ValidationCount,
@@ -417,17 +469,43 @@ begin
   FNFit.MaxThreadNum := csTrainingThreadCount;
   FNFit.OnAfterEpoch := OnAfterEpoch;
   FNFit.OnAfterStep := OnAfterStep;
-  FNFit.FitLoading(
-    FNN,
-    TrainingCount,
-    ValidationCount,
-    TestCount,
-    BatchSize,
-    Epochs,
-    FDataset.GetTrainingPair,
-    FDataset.GetValidationPair,
-    FDataset.GetTestPair
-  );
+
+  // Stand up the memory-mapped training source (+ prefetch) for the hot
+  // loop. Validation/test stay on the eager FDataset, so the corpus is
+  // briefly resident twice during training -- a v1 simplification; collapse
+  // onto a single mmap source later if the box is RAM-constrained.
+  if FUseMmapTraining then
+  begin
+    FMapped := TKANMappedDataset.Create(FNN.GetFirstLayer().Output.SizeX);
+    FMapped.LoadDataset(FDataset.FileName);
+    FMapped.BindNetwork(FNN);
+    if FUsePrefetch then
+    begin
+      FPrefetcher := TKANPrefetcher.Create(FMapped.BuildTrainingSample);
+      FPrefetcher.Start;
+    end;
+  end;
+
+  try
+    FNFit.FitLoading(
+      FNN,
+      TrainingCount,
+      ValidationCount,
+      TestCount,
+      BatchSize,
+      Epochs,
+      GetTrainingPairRouted,
+      FDataset.GetValidationPair,
+      FDataset.GetTestPair
+    );
+  finally
+    if Assigned(FPrefetcher) then
+    begin
+      FPrefetcher.Stop;
+      FreeAndNil(FPrefetcher);
+    end;
+    FreeAndNil(FMapped);
+  end;
   FNN.DebugWeights;
 end;
 
