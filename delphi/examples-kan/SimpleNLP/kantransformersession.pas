@@ -109,6 +109,14 @@ const
   // is a corrective response, stopping is a termination response.
   csHeadDoubleWindow: integer = 2;
 
+  // ReduceLROnPlateau: when validation loss fails to beat its best for
+  // csLRPatience consecutive epochs, multiply the learning rate by csLRFactor,
+  // down to a floor of csLRFloorFraction * the initial rate. Targets the
+  // noisy-constant-LR failure mode; fully independent of the weight clip.
+  csLRPatience: integer = 1;
+  csLRFactor: TNeuralFloat = 0.7;
+  csLRFloorFraction: TNeuralFloat = 0.01;
+
 type
   // Snapshot of a layer's weight distribution at one moment in time.
   // Returned by ComputeLayerWeightStats; consumed by the adaptive
@@ -148,6 +156,11 @@ type
     FPrefetcher: TKANPrefetcher;
     FUseMmapTraining: boolean;
     FUsePrefetch: boolean;
+
+    // ReduceLROnPlateau state (initialised in Train).
+    FAdaptiveLR: TNeuralFloat;
+    FLRStaleEpochs: integer;
+    FLRBestLoss: TNeuralFloat;
     // Plateau-based early stopping: track best ValidationLoss and the
     // epoch it was achieved. If FPlateauWindow epochs pass without a
     // new record, the run is treated as converged and ShouldQuit is
@@ -197,6 +210,10 @@ type
     /// mmap source. Used for FitLoading val+test, CalibrateAlpha, and eval.
     procedure GetValidationPairRouted(Idx, ThreadId: integer;
       pInput, pOutput: TNNetVolume);
+    /// ReduceLROnPlateau callback: returns the current adaptive learning rate
+    /// (lowered by OnAfterEpoch when validation stalls). Assigned to the fit's
+    /// CustomLearningRateScheduleObjFn.
+    function LRSchedule(Epoch: integer): single;
   public
     constructor Create(ANN: TKANNet; ADataset: TKANTransformerDataset);
     destructor Destroy; override;
@@ -476,6 +493,13 @@ begin
   FMapped.BuildValidationSample(Idx, pInput, pOutput);
 end;
 
+function TKANTransformerSession.LRSchedule(Epoch: integer): single;
+begin
+  // OnAfterEpoch lowers FAdaptiveLR on stalled validation; this just hands the
+  // framework the current value each epoch.
+  Result := FAdaptiveLR;
+end;
+
 procedure TKANTransformerSession.Train(TrainingCount, ValidationCount,
   TestCount, BatchSize, Epochs: integer);
 begin
@@ -492,6 +516,13 @@ begin
   FNFit.MaxThreadNum := csTrainingThreadCount;
   FNFit.OnAfterEpoch := OnAfterEpoch;
   FNFit.OnAfterStep := OnAfterStep;
+
+  // ReduceLROnPlateau: drive the LR from FAdaptiveLR, which OnAfterEpoch lowers
+  // when validation stalls. Starts at the configured initial rate.
+  FAdaptiveLR := FNFit.InitialLearningRate;
+  FLRStaleEpochs := 0;
+  FLRBestLoss := 1e30;
+  FNFit.CustomLearningRateScheduleObjFn := LRSchedule;
 
   // Spin up the prefetch loader over the persistent single mmap source
   // (created in the constructor). FMapped is not Train-scoped any more.
@@ -634,6 +665,34 @@ begin
         'Plateau: no ValidationLoss improvement for %d epochs (best %.4f at epoch %d). Stopping.',
         [FPlateauWindow, FBestLoss, FBestLossEpoch]));
       FNFit.ShouldQuit := true;
+    end;
+
+    // ReduceLROnPlateau: independent of the stop / head-double plateaus. When
+    // validation fails to beat its best for csLRPatience epochs, scale the
+    // adaptive LR down (to the floor) and reset the counter. OnAfterEpoch runs
+    // at epoch end; LRSchedule hands the new value to the next epoch.
+    if FNFit.ValidationLoss < FLRBestLoss then
+    begin
+      FLRBestLoss := FNFit.ValidationLoss;
+      FLRStaleEpochs := 0;
+    end
+    else
+    begin
+      Inc(FLRStaleEpochs);
+      if FLRStaleEpochs >= csLRPatience then
+      begin
+        if FAdaptiveLR * csLRFactor >=
+           FNFit.InitialLearningRate * csLRFloorFraction then
+        begin
+          FAdaptiveLR := FAdaptiveLR * csLRFactor;
+          WriteLn(Format(
+            '[Adaptive] ValidationLoss stalled %d epoch(s); learning rate -> %.6f',
+            [FLRStaleEpochs, FAdaptiveLR]));
+        end
+        else
+          WriteLn('[Adaptive] ValidationLoss stalled but LR at floor; holding.');
+        FLRStaleEpochs := 0;
+      end;
     end;
 
     // Plateau-triggered head doubling. Tracked on a separate, shorter
