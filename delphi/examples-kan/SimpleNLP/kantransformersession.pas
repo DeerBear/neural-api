@@ -43,6 +43,22 @@ const
   // headroom for legitimate learning. Tune for v1.1.
   csWeightClipMax: TNeuralFloat = 0.20;
 
+  // Whether the energy-conserving clip runs on the *content* path
+  // (embedding, FFN, attention output projections, vocab head) at all.
+  //
+  // Epoch-3 weight dumps settled this: attention never reaches its own
+  // cap (Q/K/V max ~0.11 vs the 0.40 cap, 0% pinned), so the clip is a
+  // dormant guardrail there. But the network-wide 0.20 content clip was
+  // actively damaging the content path -- the embedding (L2) leaked to
+  // max 0.42 with 11% pinned (a single-pass spread that never reconverges,
+  // confirmed with momentum off), and the vocab head (L1319) had 4.5% of
+  // its weights pinned at the cap, shaving exactly the peaked weights that
+  // let rare tokens surface. Distribution shaping is the KAN's job, not
+  // the clip's: the clip stays neutral hygiene on the attention
+  // projections, and the embedding / FFN / output head learn unconstrained.
+  // Set True to restore the old network-wide clip.
+  csClipContentLayers: boolean = false;
+
   // Looser threshold for Q/K/V projection layers in attention blocks.
   // Attention dot products scale as Q*K, so capping Q/K at the same
   // magnitude as the rest of the network (0.20) keeps softmax outputs
@@ -820,9 +836,16 @@ begin
       Layer := FNN.Layers[LayerIdx];
       if Layer.Neurons.Count = 0 then continue;
       IsQKVLayer := QKVLayers.IndexOf(Layer) >= 0;
-      if IsQKVLayer
-        then ClipMax := FQKClipMax
-        else ClipMax := csWeightClipMax;
+      // Attention projections always clip (at the looser Q/K/V cap, where
+      // it acts as a dormant guardrail). The content path clips only when
+      // csClipContentLayers is set -- by default it learns unconstrained,
+      // so the embedding stops leaking and the vocab head stops pinning.
+      if IsQKVLayer then
+        ClipMax := FQKClipMax
+      else if csClipContentLayers then
+        ClipMax := csWeightClipMax
+      else
+        continue;
       for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
         ClipAndSpreadWeights(Layer.Neurons[NeuronIdx].Weights, ClipMax,
           FMigrationCapEnabled);
