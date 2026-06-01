@@ -56,6 +56,9 @@ type
     // Builds one training sample from a random mapped line. Same encoding as
     // the eager loader's getter. Drop-in for kanprefetch's TKANBuildSampleProc.
     procedure BuildTrainingSample(Input, Output: TNNetVolume);
+    // Deterministic-by-Idx sample for validation/test (no Random), reading the
+    // line by index. Mirrors the eager loader's GetValidationPair cut logic.
+    procedure BuildValidationSample(const Idx: integer; Input, Output: TNNetVolume);
     property Count: integer read FCount;
   end;
 
@@ -196,6 +199,27 @@ begin
   Sample := ExtractLine(Random(FCount));
   SampleLen := Min(Length(Sample), Input.SizeX);
   CutPos := Random(SampleLen - csMmapMinSampleSize) + csMmapMinSampleSize;
+  TokInt := Min(Ord(Sample[CutPos + 1]), Input.Depth - 1);
+  Input.OneHotEncodingReversed(copy(Sample, 1, CutPos));
+  Output.SetClassForSoftMax(TokInt);
+  Output.Tag := TokInt;
+end;
+
+procedure TKANMappedDataset.BuildValidationSample(const Idx: integer;
+  Input, Output: TNNetVolume);
+var
+  Sample: string;
+  SampleId, SampleLen, CutPos, TokInt: integer;
+begin
+  if FNN.GetFirstLayer().Output.Size <> Input.Size then
+    Input.ReSize(FNN.GetFirstLayer().Output);
+  if FNN.GetLastLayer().Output.Size <> Output.Size then
+    Output.ReSize(FNN.GetLastLayer().Output);
+  SampleId := Idx mod FCount;                  // deterministic, wrapped
+  Sample := ExtractLine(SampleId);
+  SampleLen := Min(Length(Sample), Input.SizeX);
+  CutPos := (Idx mod (1 + SampleLen - csMmapMinSampleSize))
+            + csMmapMinSampleSize - 1;
   TokInt := Min(Ord(Sample[CutPos + 1]), Input.Depth - 1);
   Input.OneHotEncodingReversed(copy(Sample, 1, CutPos));
   Output.SetClassForSoftMax(TokInt);

@@ -29,6 +29,7 @@ type
   private
     FDataset: TStringList;
     FDatasetSize: integer;
+    FKeptCount: integer;
     FFileName: string;
     FNN: TNNet;
     FMaxPredictCharPos: integer;
@@ -99,6 +100,7 @@ begin
   FContextLen := AContextLen;
   FDataset := TStringList.Create;
   FDatasetSize := 0;
+  FKeptCount := 0;
   FMaxPredictCharPos := AContextLen;
   FNN := nil;
   FLengthSum := 0;
@@ -139,7 +141,11 @@ begin
       LineLen := Length(Line);
       if LineLen >= csMinSampleSize then
       begin
-        FDataset.Add(LowerCase(Line) + chr(1));
+        // Line-less: count + accumulate length stats only. Samples are served
+        // from the single mmap source, so we no longer hold the ~2 GB corpus
+        // in a TStringList -- this pass exists only for RecommendedContextLen
+        // and the distribution print.
+        Inc(FKeptCount);
         // Distribution accumulators -- raw, single-log, double-log.
         // Guard the double-log: Ln(Ln(x)) requires Ln(x) > 0, so x > e
         // (~2.72). csMinSampleSize=3 satisfies this, but the guard
@@ -168,7 +174,7 @@ begin
   finally
     Reader.Free;
   end;
-  FDatasetSize := FDataset.Count;
+  FDatasetSize := FKeptCount;
   WriteLn('Loaded dataset with ', FDatasetSize, ' rows');
   if FDatasetSize > 0 then
   begin

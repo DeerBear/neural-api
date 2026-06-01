@@ -193,6 +193,10 @@ type
     /// loader, or the eager dataset depending on the FUse* flags.
     procedure GetTrainingPairRouted(Idx, ThreadId: integer;
       pInput, pOutput: TNNetVolume);
+    /// Deterministic-by-Idx validation/test getter, served from the single
+    /// mmap source. Used for FitLoading val+test, CalibrateAlpha, and eval.
+    procedure GetValidationPairRouted(Idx, ThreadId: integer;
+      pInput, pOutput: TNNetVolume);
   public
     constructor Create(ANN: TKANNet; ADataset: TKANTransformerDataset);
     destructor Destroy; override;
@@ -415,7 +419,13 @@ begin
   FBestLossEpoch := 0;
   FPlateauWindow := 10;
 
-  FMapped := nil;
+  // One persistent memory-mapped data source for the whole session lifetime
+  // -- training (random), validation, and test all read from this single
+  // mapping, so the corpus is resident exactly once (~2 GB, not ~4 GB). Built
+  // here (not in Train) so post-training eval/calibration still have data.
+  FMapped := TKANMappedDataset.Create(FNN.GetFirstLayer().Output.SizeX);
+  FMapped.LoadDataset(FDataset.FileName);
+  FMapped.BindNetwork(FNN);
   FPrefetcher := nil;
   FUseMmapTraining := true;
   FUsePrefetch := true;
@@ -452,12 +462,18 @@ begin
   // the mmap (workers stay CPU-bound, faults live in the loader). With it
   // off but mmap on, read the mapping directly (workers fault -- the
   // oversubscription-hiding arm). Otherwise fall back to the eager dataset.
+  // Prefetch on: pop a sample the loader already built from the mmap. Off:
+  // read the mapping directly (workers fault -- the oversubscription arm).
   if FUsePrefetch and Assigned(FPrefetcher) then
     FPrefetcher.GetPair(pInput, pOutput)
-  else if FUseMmapTraining and Assigned(FMapped) then
-    FMapped.BuildTrainingSample(pInput, pOutput)
   else
-    FDataset.GetTrainingPair(Idx, ThreadId, pInput, pOutput);
+    FMapped.BuildTrainingSample(pInput, pOutput);
+end;
+
+procedure TKANTransformerSession.GetValidationPairRouted(Idx, ThreadId: integer;
+  pInput, pOutput: TNNetVolume);
+begin
+  FMapped.BuildValidationSample(Idx, pInput, pOutput);
 end;
 
 procedure TKANTransformerSession.Train(TrainingCount, ValidationCount,
@@ -477,20 +493,12 @@ begin
   FNFit.OnAfterEpoch := OnAfterEpoch;
   FNFit.OnAfterStep := OnAfterStep;
 
-  // Stand up the memory-mapped training source (+ prefetch) for the hot
-  // loop. Validation/test stay on the eager FDataset, so the corpus is
-  // briefly resident twice during training -- a v1 simplification; collapse
-  // onto a single mmap source later if the box is RAM-constrained.
-  if FUseMmapTraining then
+  // Spin up the prefetch loader over the persistent single mmap source
+  // (created in the constructor). FMapped is not Train-scoped any more.
+  if FUseMmapTraining and FUsePrefetch then
   begin
-    FMapped := TKANMappedDataset.Create(FNN.GetFirstLayer().Output.SizeX);
-    FMapped.LoadDataset(FDataset.FileName);
-    FMapped.BindNetwork(FNN);
-    if FUsePrefetch then
-    begin
-      FPrefetcher := TKANPrefetcher.Create(FMapped.BuildTrainingSample);
-      FPrefetcher.Start;
-    end;
+    FPrefetcher := TKANPrefetcher.Create(FMapped.BuildTrainingSample);
+    FPrefetcher.Start;
   end;
 
   try
@@ -502,8 +510,8 @@ begin
       BatchSize,
       Epochs,
       GetTrainingPairRouted,
-      FDataset.GetValidationPair,
-      FDataset.GetTestPair
+      GetValidationPairRouted,
+      GetValidationPairRouted
     );
   finally
     if Assigned(FPrefetcher) then
@@ -511,7 +519,6 @@ begin
       FPrefetcher.Stop;
       FreeAndNil(FPrefetcher);
     end;
-    FreeAndNil(FMapped);
   end;
   FNN.DebugWeights;
 end;
@@ -546,7 +553,7 @@ begin
   // only the SharpenAlpha hyperparameter persists from the sweep, and
   // the alpha selected is the one with the lowest observed validation
   // loss across iterations.
-  FNN.CalibrateAlpha(FDataset.GetValidationPair, ValidationCount);
+  FNN.CalibrateAlpha(GetValidationPairRouted, ValidationCount);
   WriteLn('--- Post-calibration generation: ---');
   // Same non-destructive pattern as LockAndGenerate: the post-cal
   // generation samples must not drift coefficients either, otherwise a
@@ -878,7 +885,7 @@ begin
     LastLayer := FNN.GetLastLayer;
     for I := 0 to SampleCount - 1 do
     begin
-      FDataset.GetValidationPair(I, 0, InputVol, OutputVol);
+      FMapped.BuildValidationSample(I, InputVol, OutputVol);
       Tok := OutputVol.Tag;                    // true next-char index
       if (Tok < 0) or (Tok >= V) then Continue;
       FNN.Compute(InputVol);
