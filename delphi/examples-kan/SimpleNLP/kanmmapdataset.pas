@@ -28,6 +28,9 @@ uses
 const
   csMmapMinSampleSize = 3;
   csMmapSentinel = #1;
+  // Progress cadence for the one-pass line index (otherwise silent on a
+  // multi-GB file). Report every this-many bytes scanned.
+  csMmapReportBytes = 256 * 1024 * 1024;
 
 type
   TKANMappedDataset = class
@@ -86,7 +89,7 @@ end;
 procedure TKANMappedDataset.LoadDataset(const AFileName: string);
 var
   SizeHi, SizeLo: DWORD;
-  P, LineStart: Int64;
+  P, LineStart, NextReport: Int64;
   LineByteLen, Capacity, NewCap: integer;
 
   procedure AddLine(const Ofs: Int64; const Len: integer);
@@ -125,11 +128,18 @@ begin
     raise Exception.CreateFmt('TKANMappedDataset: MapViewOfFile failed (err %d)',
       [GetLastError]);
 
+  // One pass: split on LF, trim a trailing CR -- mirrors ReadLine semantics.
+  // Periodic progress, since this scans the whole (multi-GB) file and would
+  // otherwise be a silent black box between "Computing..." and the first
+  // training log. ByteAt is inline + NativeUInt-safe past 2 GB.
+  WriteLn(Format('  memory-mapped %d MB; indexing lines...',
+    [FSize div (1024 * 1024)]));
+  Flush(Output);
   Capacity := 0;
   FCount := 0;
   LineStart := 0;
+  NextReport := csMmapReportBytes;
   P := 0;
-  // One pass: split on LF, trim a trailing CR -- mirrors ReadLine semantics.
   while P < FSize do
   begin
     if ByteAt(P) = 10 then            // LF
@@ -140,10 +150,20 @@ begin
       AddLine(LineStart, LineByteLen);
       LineStart := P + 1;
     end;
+    if P >= NextReport then
+    begin
+      WriteLn(Format('  mmap indexing: %d MB scanned, %d lines kept',
+        [P div (1024 * 1024), FCount]));
+      Flush(Output);
+      NextReport := NextReport + csMmapReportBytes;
+    end;
     Inc(P);
   end;
   if LineStart < FSize then           // trailing line, no final newline
     AddLine(LineStart, Integer(FSize - LineStart));
+  WriteLn(Format('  mmap index complete: %d lines kept from %d MB',
+    [FCount, FSize div (1024 * 1024)]));
+  Flush(Output);
 end;
 
 function TKANMappedDataset.ExtractLine(const Idx: integer): string;
