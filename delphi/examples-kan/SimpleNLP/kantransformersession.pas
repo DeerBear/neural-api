@@ -205,6 +205,13 @@ type
     // validation cross-entropy, then re-generate. Must be called after
     // LockAndGenerate (or after FNN is otherwise in inference mode).
     procedure CalibrateAndGenerate(ValidationCount: integer);
+    /// Teacher-forced, frequency-stratified next-char NLL on held-out data,
+    /// no sampler involved. Run on the SAME checkpoint in both modes (KAN
+    /// disabled = softmax baseline, vs KAN engaged+warmed) and compare the
+    /// 'rare' third -- the sampler-free measurement of whether KAN puts more
+    /// probability mass on rare-but-correct tokens. Scores whatever mode the
+    /// network is currently in; the caller sets the mode.
+    procedure EvaluateStratifiedNLL(const SampleCount: integer);
     property PlateauWindow: integer
       read FPlateauWindow write FPlateauWindow;
     // Route training through the mmap loader (default true). When false, the
@@ -830,6 +837,92 @@ begin
     end;
   finally
     QKVLayers.Free;
+  end;
+end;
+
+procedure TKANTransformerSession.EvaluateStratifiedNLL(const SampleCount: integer);
+// Teacher-forced, frequency-stratified next-char NLL over held-out validation
+// samples -- no sampler. For each sample it reads the probability the model
+// assigns to the TRUE next char, accumulates -ln() per char, then buckets the
+// vocab by how often each char actually occurs (common / mid / rare third of
+// the observed token mass) and reports mean NLL per bucket. Run twice on the
+// SAME checkpoint -- once KAN-disabled (softmax baseline), once KAN-engaged --
+// and compare the 'rare' third: that is the sampler-free "does KAN put more
+// mass on rare-but-correct tokens" measurement. NOTE: in KAN mode each Compute
+// mutates the spline state, so the caller should SnapshotAllCoeffs before /
+// RestoreAllCoeffs after for a non-destructive read.
+var
+  InputVol, OutputVol: TNNetVolume;
+  V, I, J, Tok, B, tmp: integer;
+  Prob, NLLv: TNeuralFloat;
+  SumNLL: array of Double;
+  Cnt: array of Int64;
+  Order: array of integer;
+  BSumNLL: array[0..2] of Double;
+  BCnt: array[0..2] of Int64;
+  TotalCnt, RunCnt: Int64;
+  LastLayer: TNNetLayer;
+const
+  QFloor = 1e-30;
+  BucketName: array[0..2] of string = ('common', 'mid', 'rare');
+begin
+  V := FNN.GetLastLayer.Output.Size;          // vocab size (softmax width)
+  SetLength(SumNLL, V);
+  SetLength(Cnt, V);
+  SetLength(Order, V);
+  for I := 0 to V - 1 do begin SumNLL[I] := 0; Cnt[I] := 0; Order[I] := I; end;
+
+  InputVol := TNNetVolume.Create;
+  OutputVol := TNNetVolume.Create;
+  try
+    LastLayer := FNN.GetLastLayer;
+    for I := 0 to SampleCount - 1 do
+    begin
+      FDataset.GetValidationPair(I, 0, InputVol, OutputVol);
+      Tok := OutputVol.Tag;                    // true next-char index
+      if (Tok < 0) or (Tok >= V) then Continue;
+      FNN.Compute(InputVol);
+      Prob := LastLayer.Output.FData[Tok];
+      if Prob < QFloor then Prob := QFloor;
+      NLLv := -Ln(Prob);
+      SumNLL[Tok] := SumNLL[Tok] + NLLv;
+      Cnt[Tok] := Cnt[Tok] + 1;
+    end;
+
+    // Rank chars by observed frequency, descending. V<=128, O(n^2) is fine.
+    for I := 0 to V - 2 do
+      for J := I + 1 to V - 1 do
+        if Cnt[Order[J]] > Cnt[Order[I]] then
+        begin tmp := Order[I]; Order[I] := Order[J]; Order[J] := tmp; end;
+
+    TotalCnt := 0;
+    for I := 0 to V - 1 do TotalCnt := TotalCnt + Cnt[I];
+
+    // Walk common -> rare, splitting the observed token mass into thirds.
+    for B := 0 to 2 do begin BSumNLL[B] := 0; BCnt[B] := 0; end;
+    RunCnt := 0;
+    for I := 0 to V - 1 do
+    begin
+      Tok := Order[I];
+      if Cnt[Tok] = 0 then Continue;
+      if RunCnt < TotalCnt div 3 then B := 0
+      else if RunCnt < (2 * TotalCnt) div 3 then B := 1
+      else B := 2;
+      BSumNLL[B] := BSumNLL[B] + SumNLL[Tok];
+      BCnt[B] := BCnt[B] + Cnt[Tok];
+      RunCnt := RunCnt + Cnt[Tok];
+    end;
+
+    WriteLn(Format('Stratified NLL over %d samples (%d scored tokens):',
+      [SampleCount, TotalCnt]));
+    for B := 0 to 2 do
+      if BCnt[B] > 0 then
+        WriteLn(Format('  %-6s third: mean NLL = %.4f  (%d tokens)',
+          [BucketName[B], BSumNLL[B] / BCnt[B], BCnt[B]]));
+    Flush(Output);
+  finally
+    InputVol.Free;
+    OutputVol.Free;
   end;
 end;
 
