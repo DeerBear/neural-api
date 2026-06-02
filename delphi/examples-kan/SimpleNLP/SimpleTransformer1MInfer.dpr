@@ -63,11 +63,21 @@ var
   Session: TKANTransformerSession;
   CheckpointFile: string;
   ValidationCount: integer;
+  StratifiedSampleCount: integer;
 begin
   if ParamCount >= 1 then
     CheckpointFile := ParamStr(1)
   else
     CheckpointFile := csDefaultCheckpoint;
+
+  // Optional 2nd arg: teacher-forced samples for the stratified NLL read.
+  // Each is one forward pass and the read runs twice (baseline + KAN), so
+  // keep it bounded on CPU. Default 16000 -- enough to populate the rare
+  // bucket; pass a smaller number for a quicker, noisier read.
+  if ParamCount >= 2 then
+    StratifiedSampleCount := StrToIntDef(ParamStr(2), 16000)
+  else
+    StratifiedSampleCount := 16000;
 
   WriteLn('Inference run using checkpoint: ', CheckpointFile);
 
@@ -78,11 +88,12 @@ begin
     Dataset.LoadDataset;
 
     // Inference must build the network with the SAME context length the
-    // checkpoint was trained at; positional embedding weights are sized
-    // to ContextLen. Using a different value here would fail to load.
-    // csContextLen is the legacy fixed value (81) used for training runs
-    // up to and including autosave_epoch26.nn.
-    Net := BuildKANTransformer1M(csContextLen);
+    // checkpoint was trained at; positional-embedding weights are sized to
+    // ContextLen, so a mismatch fails LoadDataFromFile. The training driver
+    // (SimpleTransformer1M) builds from Dataset.RecommendedContextLen (84 on
+    // the current corpus), so match that here. The legacy csContextLen (81)
+    // is only correct for old checkpoints up to autosave_epoch26.nn.
+    Net := BuildKANTransformer1M(Dataset.RecommendedContextLen);
     try
       Dataset.BindNetwork(Net);
 
@@ -101,8 +112,28 @@ begin
       Session := TKANTransformerSession.Create(Net, Dataset);
       try
         ValidationCount := 32000 * 3 div 20;
+
+        // Rare-bucket stratified NLL: baseline vs KAN. The network trains as
+        // vanilla softmax attention; the KAN normaliser only activates after
+        // LockToInference. So measure the teacher-forced, frequency-stratified
+        // NLL BEFORE locking (softmax baseline) and AFTER the inference warm-up
+        // passes (KAN-mode). The KAN hypothesis is the per-bucket delta between
+        // the two -- especially on the rare third.
+        WriteLn('');
+        WriteLn('=== Stratified NLL: BASELINE (softmax, pre-LockToInference) ===');
+        Session.EvaluateStratifiedNLL(StratifiedSampleCount);
+
         Session.LockAndGenerate;
         Session.CalibrateAndGenerate(ValidationCount);
+
+        // Post-lock + post-generation: the KAN has now had forward passes to
+        // progress past Phase M (softmax mimicry) toward takeover / Phase D.
+        // If this reads ~identical to baseline, either the KAN is still
+        // mimicking (needs more warm-up) or the inference path isn't taking
+        // over -- both worth knowing before trusting the delta.
+        WriteLn('');
+        WriteLn('=== Stratified NLL: KAN (post-LockToInference) ===');
+        Session.EvaluateStratifiedNLL(StratifiedSampleCount);
       finally
         Session.Free;
       end;
