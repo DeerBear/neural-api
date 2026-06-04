@@ -26,7 +26,7 @@ uses
   Classes, SysUtils, Math,
   neuralvolume, neuralnetwork, neuralfit, neuralthread, neuraldatasets,
   neuralkantypes, neuralkanattention,
-  kantransformerdata, kanmmapdataset, kanprefetch;
+  kantransformerdata, mmaptextdataset, prefetchloader, checkpointcompanion;
 
 const
   // Energy-conserving per-neuron weight clipping threshold. Per-neuron
@@ -168,10 +168,18 @@ type
     // through the mmap loader; FUsePrefetch additionally decouples sample prep
     // onto a background loader thread. Validation/test stay on the eager
     // FDataset. Both default on; flip them (and MaxThreadNum) for the A/B.
-    FMapped: TKANMappedDataset;
-    FPrefetcher: TKANPrefetcher;
+    FMapped: TMappedTextDataset;
+    FPrefetcher: TPrefetcher;
     FUseMmapTraining: boolean;
     FUsePrefetch: boolean;
+
+    // Companion-file state -- the trainer is authoritative for what a checkpoint
+    // is. At Train start it captures the context the network was actually built
+    // at and hashes the corpus once (the corpus does not change mid-run); on
+    // every epoch, after the framework has saved the .nn, OnAfterEpoch writes
+    // the companion describing that just-saved checkpoint. Inference only reads.
+    FCompContextSize: integer;
+    FCompCorpusMD5: string;
 
     // ReduceLROnPlateau state (initialised in Train).
     FAdaptiveLR: TNeuralFloat;
@@ -456,7 +464,7 @@ begin
   // -- training (random), validation, and test all read from this single
   // mapping, so the corpus is resident exactly once (~2 GB, not ~4 GB). Built
   // here (not in Train) so post-training eval/calibration still have data.
-  FMapped := TKANMappedDataset.Create(FNN.GetFirstLayer().Output.SizeX);
+  FMapped := TMappedTextDataset.Create(FNN.GetFirstLayer().Output.SizeX);
   FMapped.LoadDataset(FDataset.FileName);
   FMapped.BindNetwork(FNN);
   FPrefetcher := nil;
@@ -540,11 +548,21 @@ begin
   FLRBestLoss := 1e30;
   FNFit.CustomLearningRateScheduleObjFn := LRSchedule;
 
+  // Trainer-authoritative companion setup. Capture the context the network was
+  // actually built at (its input layer's X size) and hash the corpus once;
+  // both are reused when OnAfterEpoch writes the companion after each save.
+  FCompContextSize := FNN.GetFirstLayer().Output.SizeX;
+  // Corpus hash = the dataset's chained HMAC-MD5 over the raw lines, computed
+  // during LoadDataset (already run before Train) -- not a plain file MD5.
+  FCompCorpusMD5 := FDataset.CorpusHash;
+  WriteLn(Format('  Companion: context=%d, corpus hash=%s',
+    [FCompContextSize, FCompCorpusMD5]));
+
   // Spin up the prefetch loader over the persistent single mmap source
   // (created in the constructor). FMapped is not Train-scoped any more.
   if FUseMmapTraining and FUsePrefetch then
   begin
-    FPrefetcher := TKANPrefetcher.Create(FMapped.BuildTrainingSample);
+    FPrefetcher := TPrefetcher.Create(FMapped.BuildTrainingSample);
     FPrefetcher.Start;
   end;
 
@@ -663,6 +681,7 @@ var
   MinAcc, MaxAcc, Oscillation: TNeuralFloat;
   AnyHomogenizationMatch, AnySaturationMatch: boolean;
   Stats: TLayerWeightStats;
+  Companion: TCheckpointCompanion;
 begin
   GenerateSamples;
 
@@ -670,6 +689,21 @@ begin
   // populates ValidationLoss / CurrentEpoch); skip otherwise.
   if Sender = FNFit then
   begin
+    // Trainer-authoritative companion. OnAfterEpoch runs AFTER the framework
+    // saves the .nn (the save precedes this callback), so the file on disk is
+    // the just-saved checkpoint. (Re)write its companion -- context + the
+    // once-hashed corpus MD5 + the .nn's current MD5 -- so it always describes
+    // the checkpoint as saved. Skipped until a .nn exists.
+    if FileExists(FNFit.FileNameBase + '.nn') then
+    begin
+      Companion := TCheckpointCompanion.Create(FNFit.FileNameBase + '.nn');
+      try
+        Companion.Write(FCompContextSize, FCompCorpusMD5);
+      finally
+        Companion.Free;
+      end;
+    end;
+
     if FNFit.ValidationLoss < FBestLoss then
     begin
       FBestLoss := FNFit.ValidationLoss;

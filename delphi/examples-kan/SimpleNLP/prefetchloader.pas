@@ -1,4 +1,4 @@
-unit kanprefetch;
+unit prefetchloader;
 
 (*
 Asynchronous sample prefetch for the KAN transformer training loop.
@@ -41,10 +41,10 @@ type
   // loader thread during normal running (never concurrently), so it may use
   // the same global-Random sampling the inline getter already uses. Must
   // size the volumes itself, exactly as the existing GetTrainingPair does.
-  TKANBuildSampleProc = procedure(Input, Output: TNNetVolume) of object;
+  TBuildSampleProc = procedure(Input, Output: TNNetVolume) of object;
 
   // One recycled buffer: a prepared (input, output) pair.
-  TKANSamplePair = class
+  TSamplePair = class
   public
     Input: TNNetVolume;
     Output: TNNetVolume;
@@ -52,18 +52,18 @@ type
     destructor Destroy; override;
   end;
 
-  TKANPrefetcher = class
+  TPrefetcher = class
   private
-    FReady: TThreadedQueue<TKANSamplePair>;   // built, waiting for a worker
-    FFree:  TThreadedQueue<TKANSamplePair>;    // recycled, waiting for the loader
+    FReady: TThreadedQueue<TSamplePair>;   // built, waiting for a worker
+    FFree:  TThreadedQueue<TSamplePair>;    // recycled, waiting for the loader
     FLoader: TThread;
-    FBuild: TKANBuildSampleProc;
+    FBuild: TBuildSampleProc;
     FRunning: boolean;
     procedure ProduceLoop;
   public
     // ABuild: the dataset's per-sample builder. ADepth: ready-queue capacity
     // (a few batches' worth is plenty; this is also the buffer-pool size).
-    constructor Create(const ABuild: TKANBuildSampleProc;
+    constructor Create(const ABuild: TBuildSampleProc;
       const ADepth: integer = 64);
     destructor Destroy; override;
 
@@ -82,37 +82,37 @@ implementation
 type
   // Implementation-only: same-unit "private" access lets Execute reach the
   // owner's ProduceLoop. FLoader is typed as TThread in the interface.
-  TKANLoaderThread = class(TThread)
+  TLoaderThread = class(TThread)
   public
-    Owner: TKANPrefetcher;
+    Owner: TPrefetcher;
   protected
     procedure Execute; override;
   end;
 
-procedure TKANLoaderThread.Execute;
+procedure TLoaderThread.Execute;
 begin
   Owner.ProduceLoop;
 end;
 
-{ TKANSamplePair }
+{ TSamplePair }
 
-constructor TKANSamplePair.Create;
+constructor TSamplePair.Create;
 begin
   inherited Create;
   Input := TNNetVolume.Create;
   Output := TNNetVolume.Create;
 end;
 
-destructor TKANSamplePair.Destroy;
+destructor TSamplePair.Destroy;
 begin
   Input.Free;
   Output.Free;
   inherited Destroy;
 end;
 
-{ TKANPrefetcher }
+{ TPrefetcher }
 
-constructor TKANPrefetcher.Create(const ABuild: TKANBuildSampleProc;
+constructor TPrefetcher.Create(const ABuild: TBuildSampleProc;
   const ADepth: integer);
 var
   I: integer;
@@ -122,16 +122,16 @@ begin
   FRunning := false;
   // Default (INFINITE) push/pop timeouts: producers/consumers block until
   // there is room / an item, or until DoShutDown releases them.
-  FReady := TThreadedQueue<TKANSamplePair>.Create(ADepth);
-  FFree  := TThreadedQueue<TKANSamplePair>.Create(ADepth);
+  FReady := TThreadedQueue<TSamplePair>.Create(ADepth);
+  FFree  := TThreadedQueue<TSamplePair>.Create(ADepth);
   // Pre-fill the buffer pool so steady state allocates nothing per sample.
   for I := 0 to ADepth - 1 do
-    FFree.PushItem(TKANSamplePair.Create);
+    FFree.PushItem(TSamplePair.Create);
 end;
 
-destructor TKANPrefetcher.Destroy;
+destructor TPrefetcher.Destroy;
 var
-  Pair: TKANSamplePair;
+  Pair: TSamplePair;
 begin
   Stop;
   // Drain and free both pools. DoShutDown (in Stop) makes PopItem return a
@@ -143,20 +143,20 @@ begin
   inherited Destroy;
 end;
 
-procedure TKANPrefetcher.Start;
+procedure TPrefetcher.Start;
 var
-  L: TKANLoaderThread;
+  L: TLoaderThread;
 begin
   if FRunning then exit;
   FRunning := true;
-  L := TKANLoaderThread.Create(true);   // suspended
+  L := TLoaderThread.Create(true);   // suspended
   L.Owner := Self;
   L.FreeOnTerminate := false;
   FLoader := L;
   L.Start;
 end;
 
-procedure TKANPrefetcher.Stop;
+procedure TPrefetcher.Stop;
 begin
   if not FRunning then exit;
   FRunning := false;
@@ -171,9 +171,9 @@ begin
   end;
 end;
 
-procedure TKANPrefetcher.ProduceLoop;
+procedure TPrefetcher.ProduceLoop;
 var
-  Pair: TKANSamplePair;
+  Pair: TSamplePair;
 begin
   while FRunning do
   begin
@@ -187,9 +187,9 @@ begin
   end;
 end;
 
-procedure TKANPrefetcher.GetPair(Input, Output: TNNetVolume);
+procedure TPrefetcher.GetPair(Input, Output: TNNetVolume);
 var
-  Pair: TKANSamplePair;
+  Pair: TSamplePair;
 begin
   if (not FRunning) or (FReady.PopItem(Pair) <> wrSignaled) then
   begin

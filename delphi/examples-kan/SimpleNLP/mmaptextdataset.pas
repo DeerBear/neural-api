@@ -1,4 +1,4 @@
-unit kanmmapdataset;
+unit mmaptextdataset;
 
 (*
 Memory-mapped TinyStories dataset for the KAN transformer.
@@ -12,7 +12,7 @@ the per-sample work is downstream of it.
 Windows memory mapping (CreateFileMapping / MapViewOfFile). The mapped view is
 read-only; extracted lines are copied out (and lowercased + sentinel-appended)
 only when a sample is built, so the mapping itself is never mutated. Pairs
-directly with kanprefetch: BuildTrainingSample is a drop-in TKANBuildSampleProc.
+directly with prefetchloader: BuildTrainingSample is a drop-in TBuildSampleProc.
 
 STATUS: v1, written without a Delphi toolchain available. Validate on a real
 run. Pointer arithmetic is done through NativeUInt so it does not depend on
@@ -33,7 +33,7 @@ const
   csMmapReportBytes = 256 * 1024 * 1024;
 
 type
-  TKANMappedDataset = class
+  TMappedTextDataset = class
   private
     FFile: THandle;
     FMap: THandle;
@@ -54,7 +54,7 @@ type
     // from the network's first/last layers.
     procedure BindNetwork(ANN: TNNet);
     // Builds one training sample from a random mapped line. Same encoding as
-    // the eager loader's getter. Drop-in for kanprefetch's TKANBuildSampleProc.
+    // the eager loader's getter. Drop-in for prefetchloader's TBuildSampleProc.
     procedure BuildTrainingSample(Input, Output: TNNetVolume);
     // Deterministic-by-Idx sample for validation/test (no Random), reading the
     // line by index. Mirrors the eager loader's GetValidationPair cut logic.
@@ -64,7 +64,7 @@ type
 
 implementation
 
-constructor TKANMappedDataset.Create(const AContextLen: integer);
+constructor TMappedTextDataset.Create(const AContextLen: integer);
 begin
   inherited Create;
   FFile := INVALID_HANDLE_VALUE;
@@ -76,7 +76,7 @@ begin
   FNN := nil;
 end;
 
-destructor TKANMappedDataset.Destroy;
+destructor TMappedTextDataset.Destroy;
 begin
   if FView <> nil then UnmapViewOfFile(FView);
   if FMap <> 0 then CloseHandle(FMap);
@@ -84,12 +84,12 @@ begin
   inherited Destroy;
 end;
 
-function TKANMappedDataset.ByteAt(const Ofs: Int64): byte;
+function TMappedTextDataset.ByteAt(const Ofs: Int64): byte;
 begin
   Result := PByte(NativeUInt(FView) + NativeUInt(Ofs))^;
 end;
 
-procedure TKANMappedDataset.LoadDataset(const AFileName: string);
+procedure TMappedTextDataset.LoadDataset(const AFileName: string);
 var
   SizeHi, SizeLo: DWORD;
   P, LineStart, NextReport: Int64;
@@ -116,7 +116,7 @@ begin
   FFile := CreateFile(PChar(AFileName), GENERIC_READ, FILE_SHARE_READ, nil,
     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
   if FFile = INVALID_HANDLE_VALUE then
-    raise Exception.CreateFmt('TKANMappedDataset: cannot open %s (err %d)',
+    raise Exception.CreateFmt('TMappedTextDataset: cannot open %s (err %d)',
       [AFileName, GetLastError]);
 
   SizeLo := GetFileSize(FFile, @SizeHi);
@@ -124,11 +124,11 @@ begin
 
   FMap := CreateFileMapping(FFile, nil, PAGE_READONLY, 0, 0, nil);
   if FMap = 0 then
-    raise Exception.CreateFmt('TKANMappedDataset: CreateFileMapping failed (err %d)',
+    raise Exception.CreateFmt('TMappedTextDataset: CreateFileMapping failed (err %d)',
       [GetLastError]);
   FView := MapViewOfFile(FMap, FILE_MAP_READ, 0, 0, 0);
   if FView = nil then
-    raise Exception.CreateFmt('TKANMappedDataset: MapViewOfFile failed (err %d)',
+    raise Exception.CreateFmt('TMappedTextDataset: MapViewOfFile failed (err %d)',
       [GetLastError]);
 
   // One pass: split on LF, trim a trailing CR -- mirrors ReadLine semantics.
@@ -169,7 +169,7 @@ begin
   Flush(Output);
 end;
 
-function TKANMappedDataset.ExtractLine(const Idx: integer): string;
+function TMappedTextDataset.ExtractLine(const Idx: integer): string;
 var
   Raw: AnsiString;
   Len: integer;
@@ -182,12 +182,12 @@ begin
   Result := LowerCase(string(Raw)) + csMmapSentinel;
 end;
 
-procedure TKANMappedDataset.BindNetwork(ANN: TNNet);
+procedure TMappedTextDataset.BindNetwork(ANN: TNNet);
 begin
   FNN := ANN;
 end;
 
-procedure TKANMappedDataset.BuildTrainingSample(Input, Output: TNNetVolume);
+procedure TMappedTextDataset.BuildTrainingSample(Input, Output: TNNetVolume);
 var
   Sample: string;
   SampleLen, CutPos, TokInt: integer;
@@ -205,7 +205,7 @@ begin
   Output.Tag := TokInt;
 end;
 
-procedure TKANMappedDataset.BuildValidationSample(const Idx: integer;
+procedure TMappedTextDataset.BuildValidationSample(const Idx: integer;
   Input, Output: TNNetVolume);
 var
   Sample: string;

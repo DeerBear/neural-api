@@ -62,8 +62,8 @@ uses
   neuralkanattention in '..\..\neural\neuralkanattention.pas',
   kantransformerarch in 'kantransformerarch.pas',
   kantransformerdata in 'kantransformerdata.pas',
-  kanmmapdataset in 'kanmmapdataset.pas',
-  kanprefetch in 'kanprefetch.pas',
+  mmaptextdataset in 'mmaptextdataset.pas',
+  prefetchloader in 'prefetchloader.pas',
   kantransformersession in 'kantransformersession.pas',
   kanweightremix in 'kanweightremix.pas';
 
