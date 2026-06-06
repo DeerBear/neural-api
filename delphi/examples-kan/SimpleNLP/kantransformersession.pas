@@ -10,7 +10,7 @@ LockToInference → CalibrateAlpha → re-generate sequence.
 
 Two entry points:
   * Train() — full training loop with stabilisers and plateau detection.
-  * LockAndGenerate() / CalibrateAndGenerate() — inference-time
+  * LockAndGenerate() / GenerateAtAlpha() — inference-time
     operations. Callable without prior Train() when a saved checkpoint
     has been loaded via FNN.LoadDataFromFile into a freshly-built
     architecture.
@@ -246,10 +246,13 @@ type
     // Engage the KAN attention path on the trained (or weight-loaded)
     // network and generate the canonical prompt set with baseline alpha.
     procedure LockAndGenerate;
-    // Run continuous EMA-driven calibration of SharpenAlpha against
-    // validation cross-entropy, then re-generate. Must be called after
+    // Generate the canonical prompt set at a FIXED SharpenAlpha (Option 3:
+    // per-pass finite-difference calibration is disabled -- alpha only steers
+    // the Phase-D NLMS target, never a single pass's output, so it cannot be
+    // tuned by a one-pass finite difference). Call repeatedly with different
+    // alphas to sweep within one locked run. Must be called after
     // LockAndGenerate (or after FNN is otherwise in inference mode).
-    procedure CalibrateAndGenerate(ValidationCount: integer);
+    procedure GenerateAtAlpha(const AAlpha: TNeuralFloat);
     /// Teacher-forced, frequency-stratified next-char NLL on held-out data,
     /// no sampler involved. Run on the SAME checkpoint in both modes (KAN
     /// disabled = softmax baseline, vs KAN engaged+warmed) and compare the
@@ -596,7 +599,14 @@ begin
   // passthrough to its B-spline normaliser. LockToInference is one-way --
   // no further training is permitted on FNN.
   FNN.LockToInference;
-  WriteLn('--- KAN attention engaged; post-training generation (baseline alpha=1.1): ---');
+  WriteLn(Format('--- KAN attention engaged; post-training generation (alpha=%.3f): ---',
+    [FNN.GetCurrentAlpha]));
+  // Telemetry right after lock. Every head should read ksSoftmaxActive
+  // (Phase M / mimicry) here: handover to Phase D (ksKANActive) only fires
+  // once enough inference passes drive KLEMA below threshold. This is the
+  // baseline -- the "did the KAN actually take over?" reference point.
+  WriteLn('--- KAN state immediately after lock ---');
+  Write(FNN.KANTelemetry);
   // Inference-mode Compute mutates FHead.Coeffs on every forward pass
   // (NLMS Phase M/D, see TNNetKANNormaliser.Compute step 7). Snapshot
   // around generation so the loaded checkpoint is left untouched after
@@ -607,29 +617,41 @@ begin
   finally
     FNN.RestoreAllCoeffs(Snapshot);
   end;
+  // Coeffs were rolled back, but Status/KLEMA are not part of the coeff
+  // snapshot, so this reflects whatever handover / KL movement the generation
+  // passes drove. If status still reads all-SM, the KAN never left mimicry
+  // and SharpenAlpha is inert by construction for this checkpoint.
+  WriteLn('--- KAN state after baseline generation ---');
+  Write(FNN.KANTelemetry);
 end;
 
-procedure TKANTransformerSession.CalibrateAndGenerate(ValidationCount: integer);
+procedure TKANTransformerSession.GenerateAtAlpha(const AAlpha: TNeuralFloat);
 var
   Snapshot: TKANCoeffSnapshot;
 begin
-  WriteLn('--- Calibrating SharpenAlpha against validation loss ---');
-  // CalibrateAlpha defaults to PreserveCoeffs=true + UseBestAlpha=true:
-  // only the SharpenAlpha hyperparameter persists from the sweep, and
-  // the alpha selected is the one with the lowest observed validation
-  // loss across iterations.
-  FNN.CalibrateAlpha(GetValidationPairRouted, ValidationCount);
-  WriteLn('--- Post-calibration generation: ---');
-  // Same non-destructive pattern as LockAndGenerate: the post-cal
-  // generation samples must not drift coefficients either, otherwise a
-  // subsequent inspection (or a re-run of CalibrateAndGenerate) would
-  // see a network that differs from the calibrated state.
+  // Option 3: no per-pass calibration. SharpenAlpha only sets the Phase-D
+  // NLMS *target* (the sharpened self-distillation distribution), so it
+  // influences future passes through slow coefficient adaptation, never the
+  // current pass's output -- a one-pass finite difference measures ~zero
+  // gradient and cannot tune it. We therefore set a fixed alpha and generate;
+  // sweep alpha by calling this again with another value (the network stays
+  // locked) or across separate runs.
+  WriteLn(Format('--- Fixed SharpenAlpha = %.3f (per-pass calibration disabled) ---',
+    [AAlpha]));
+  FNN.SetAllAlpha(AAlpha);
+  WriteLn('--- KAN state before fixed-alpha generation ---');
+  Write(FNN.KANTelemetry);
+  // Non-destructive read: roll coefficients back after generation so a
+  // subsequent GenerateAtAlpha (a different sweep point) starts from the same
+  // post-lock state rather than this run's drift.
   Snapshot := FNN.SnapshotAllCoeffs;
   try
     GenerateSamples;
   finally
     FNN.RestoreAllCoeffs(Snapshot);
   end;
+  WriteLn('--- KAN state after fixed-alpha generation ---');
+  Write(FNN.KANTelemetry);
 end;
 
 procedure TKANTransformerSession.GenerateSamples;

@@ -84,7 +84,6 @@ var
   Net: TKANNet;
   Session: TKANTransformerSession;
   RecentFile, HealthyFile: string;
-  ValidationCount: integer;
 begin
   if ParamCount >= 2 then
   begin
@@ -142,9 +141,9 @@ begin
 
       Session := TKANTransformerSession.Create(Net, Dataset);
       try
-        ValidationCount := 32000 * 3 div 20;
         Session.LockAndGenerate;
-        Session.CalibrateAndGenerate(ValidationCount);
+        // Fixed SharpenAlpha (Option 3: per-pass calibration disabled).
+        Session.GenerateAtAlpha(1.1);
       finally
         Session.Free;
       end;

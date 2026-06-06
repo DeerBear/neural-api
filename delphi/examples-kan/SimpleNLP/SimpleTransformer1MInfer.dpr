@@ -6,8 +6,11 @@ Inference-only driver for the KAN transformer.
 
 Builds the same architecture as SimpleTransformer1M, loads weights from a
 saved checkpoint via TNNet.LoadDataFromFile, then runs the
-LockToInference + baseline-generate + CalibrateAlpha + recalibrated-
-generate sequence -- skipping the training loop entirely.
+LockToInference + baseline-generate + fixed-alpha-generate sequence,
+printing KAN telemetry (handover state) at each stage -- skipping the
+training loop entirely. Per-pass SharpenAlpha calibration is disabled
+(Option 3): alpha only steers the Phase-D NLMS target, not a single pass's
+output, so it is set as a fixed hyperparameter and swept across runs.
 
 Context length is resolved from the checkpoint's companion file (see
 checkpointcompanion):
@@ -58,13 +61,16 @@ uses
 const
   csTrainingFileName = 'datasets/tinystories.txt';
   csDefaultCheckpoint = 'autosave.nn';
+  // Fixed inference-time SharpenAlpha (Option 3: per-pass calibration is
+  // disabled). Sweep by changing this and re-running, or add more
+  // Session.GenerateAtAlpha(...) calls below to compare alphas in one run.
+  csInferenceAlpha = 1.1;
 
 var
   Dataset: TKANTransformerDataset;
   Net: TKANNet;
   Session: TKANTransformerSession;
   CheckpointFile: string;
-  ValidationCount: integer;
   Comp: TCheckpointCompanion;
   ContextLen: integer;
   Recovered: boolean;
@@ -78,8 +84,8 @@ begin
 
   Dataset := TKANTransformerDataset.Create(csTrainingFileName, csContextLen);
   try
-    // Dataset is loaded so CalibrateAlpha has something to score against, and
-    // so RecommendedContextLen is available for the recover path below.
+    // Dataset is loaded so RecommendedContextLen and CorpusHash are available
+    // for the companion resolve / recover path below.
     Dataset.LoadDataset;
 
     // --- Resolve context length via the shared companion mechanism ---
@@ -115,9 +121,8 @@ begin
 
       Session := TKANTransformerSession.Create(Net, Dataset);
       try
-        ValidationCount := 32000 * 3 div 20;
         Session.LockAndGenerate;
-        Session.CalibrateAndGenerate(ValidationCount);
+        Session.GenerateAtAlpha(csInferenceAlpha);
       finally
         Session.Free;
       end;
