@@ -205,7 +205,7 @@ begin
       Inc(LineNum);
       if (LineNum mod 100000) = 0 then
       begin
-        WriteLn('  read ', LineNum, ' lines, kept ', FDataset.Count);
+        WriteLn('  read ', LineNum, ' lines, kept ', FKeptCount);
         Flush(Output);
       end;
     end;
