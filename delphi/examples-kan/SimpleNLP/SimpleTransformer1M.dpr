@@ -59,11 +59,17 @@ uses
   neuralkanattention in '..\..\neural\neuralkanattention.pas',
   kantransformerarch in 'kantransformerarch.pas',
   kantransformerdata in 'kantransformerdata.pas',
+  mmaptextdataset in 'mmaptextdataset.pas',
+  prefetchloader in 'prefetchloader.pas',
+  checkpointcompanion in 'checkpointcompanion.pas',
   kantransformersession in 'kantransformersession.pas';
 
 const
   csTrainingFileName = 'datasets/tinystories.txt';
   csDefaultRandSeed = 1337;
+  // Fixed inference-time SharpenAlpha for the post-training generation
+  // (Option 3: per-pass calibration disabled). Sweep across runs to compare.
+  csInferenceAlpha = 1.1;
 
 var
   Dataset: TKANTransformerDataset;
@@ -112,7 +118,7 @@ begin
           {Epochs=}            500
         );
         Session.LockAndGenerate;
-        Session.CalibrateAndGenerate(ValidationCount);
+        Session.GenerateAtAlpha(csInferenceAlpha);
       finally
         Session.Free;
       end;

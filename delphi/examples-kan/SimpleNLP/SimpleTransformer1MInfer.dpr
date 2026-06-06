@@ -6,20 +6,24 @@ Inference-only driver for the KAN transformer.
 
 Builds the same architecture as SimpleTransformer1M, loads weights from a
 saved checkpoint via TNNet.LoadDataFromFile, then runs the
-LockToInference + baseline-generate + CalibrateAlpha + recalibrated-
-generate sequence -- skipping the training loop entirely.
+LockToInference + baseline-generate + fixed-alpha-generate sequence,
+printing KAN telemetry (handover state) at each stage -- skipping the
+training loop entirely. Per-pass SharpenAlpha calibration is disabled
+(Option 3): alpha only steers the Phase-D NLMS target, not a single pass's
+output, so it is set as a fixed hyperparameter and swept across runs.
 
-Why this exists: training a 1.4M-param KAN transformer on TinyStories
-takes ~2 days on the reference 4-thread non-AVX i5. Once an autosave is
-available (autosave.nn / autosave_epoch26.nn / etc.), iterating on the
-inference-time calibration -- or just regenerating with different
-prompts -- shouldn't require sitting through training again.
+Context length is resolved from the checkpoint's companion file (see
+checkpointcompanion):
+  * companion present AND corpus + nn MD5s both match -> use its context;
+  * companion absent OR either MD5 mismatched           -> recover by
+    recomputing the context from the corpus, narrating the decision.
+This keeps inference building at the SAME context the checkpoint was trained
+at (positional embeddings are sized to it), and tracks the trainer when a
+companion is available, while still loading older companion-less checkpoints.
 
-Why this works: LoadDataFromFile populates weights into a pre-built
-structure rather than recreating the structure from a serialised graph.
-The freshly-built TKANNet here has the correct TNNetKANNormaliser layers
-with their shared FBasis / FRNG / FInfo backrefs already wired up; only
-the trainable parameters need to come from disk.
+Why this exists: training a 1.4M-param KAN transformer on TinyStories takes a
+long time. Once an autosave is available, iterating on inference-time
+calibration -- or just regenerating -- shouldn't require retraining.
 
 Usage:
   SimpleTransformer1MInfer [checkpoint.nn]
@@ -49,18 +53,27 @@ uses
   neuralkanattention in '..\..\neural\neuralkanattention.pas',
   kantransformerarch in 'kantransformerarch.pas',
   kantransformerdata in 'kantransformerdata.pas',
+  mmaptextdataset in 'mmaptextdataset.pas',
+  prefetchloader in 'prefetchloader.pas',
+  checkpointcompanion in 'checkpointcompanion.pas',
   kantransformersession in 'kantransformersession.pas';
 
 const
   csTrainingFileName = 'datasets/tinystories.txt';
   csDefaultCheckpoint = 'autosave.nn';
+  // Fixed inference-time SharpenAlpha (Option 3: per-pass calibration is
+  // disabled). Sweep by changing this and re-running, or add more
+  // Session.GenerateAtAlpha(...) calls below to compare alphas in one run.
+  csInferenceAlpha = 1.1;
 
 var
   Dataset: TKANTransformerDataset;
   Net: TKANNet;
   Session: TKANTransformerSession;
   CheckpointFile: string;
-  ValidationCount: integer;
+  Comp: TCheckpointCompanion;
+  ContextLen: integer;
+  Recovered: boolean;
 begin
   if ParamCount >= 1 then
     CheckpointFile := ParamStr(1)
@@ -71,16 +84,26 @@ begin
 
   Dataset := TKANTransformerDataset.Create(csTrainingFileName, csContextLen);
   try
-    // Dataset is loaded so CalibrateAlpha has something to score against;
-    // pair-getter indices feed validation samples, same as training time.
+    // Dataset is loaded so RecommendedContextLen and CorpusHash are available
+    // for the companion resolve / recover path below.
     Dataset.LoadDataset;
 
-    // Inference must build the network with the SAME context length the
-    // checkpoint was trained at; positional embedding weights are sized
-    // to ContextLen. Using a different value here would fail to load.
-    // csContextLen is the legacy fixed value (81) used for training runs
-    // up to and including autosave_epoch26.nn.
-    Net := BuildKANTransformer1M(csContextLen);
+    // --- Resolve context length via the shared companion mechanism ---
+    // Same class the trainer writes with, so the two cannot drift. Present and
+    // content-consistent (corpus hash + nn MD5) -> stored context; otherwise
+    // recover to the recomputed context. Resolve returns the line to print.
+    Comp := TCheckpointCompanion.Create(CheckpointFile);
+    try
+      WriteLn('  ' + Comp.Resolve(Dataset.CorpusHash,
+        Dataset.RecommendedContextLen, ContextLen, Recovered));
+    finally
+      Comp.Free;
+    end;
+
+    // Build at the resolved context. If a recovered value disagrees with a
+    // stale checkpoint's real context, the load below fails on the
+    // positional-embedding shape -- the intended loud staleness signal.
+    Net := BuildKANTransformer1M(ContextLen);
     try
       Dataset.BindNetwork(Net);
 
@@ -98,9 +121,8 @@ begin
 
       Session := TKANTransformerSession.Create(Net, Dataset);
       try
-        ValidationCount := 32000 * 3 div 20;
         Session.LockAndGenerate;
-        Session.CalibrateAndGenerate(ValidationCount);
+        Session.GenerateAtAlpha(csInferenceAlpha);
       finally
         Session.Free;
       end;

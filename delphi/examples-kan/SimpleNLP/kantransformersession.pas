@@ -10,7 +10,7 @@ LockToInference → CalibrateAlpha → re-generate sequence.
 
 Two entry points:
   * Train() — full training loop with stabilisers and plateau detection.
-  * LockAndGenerate() / CalibrateAndGenerate() — inference-time
+  * LockAndGenerate() / GenerateAtAlpha() — inference-time
     operations. Callable without prior Train() when a saved checkpoint
     has been loaded via FNN.LoadDataFromFile into a freshly-built
     architecture.
@@ -26,7 +26,7 @@ uses
   Classes, SysUtils, Math,
   neuralvolume, neuralnetwork, neuralfit, neuralthread, neuraldatasets,
   neuralkantypes, neuralkanattention,
-  kantransformerdata;
+  kantransformerdata, mmaptextdataset, prefetchloader, checkpointcompanion;
 
 const
   // Energy-conserving per-neuron weight clipping threshold. Per-neuron
@@ -42,6 +42,22 @@ const
   // 0.20 keeps weights well below the runaway threshold while leaving
   // headroom for legitimate learning. Tune for v1.1.
   csWeightClipMax: TNeuralFloat = 0.20;
+
+  // Whether the energy-conserving clip runs on the *content* path
+  // (embedding, FFN, attention output projections, vocab head) at all.
+  //
+  // Epoch-3 weight dumps settled this: attention never reaches its own
+  // cap (Q/K/V max ~0.11 vs the 0.40 cap, 0% pinned), so the clip is a
+  // dormant guardrail there. But the network-wide 0.20 content clip was
+  // actively damaging the content path -- the embedding (L2) leaked to
+  // max 0.42 with 11% pinned (a single-pass spread that never reconverges,
+  // confirmed with momentum off), and the vocab head (L1319) had 4.5% of
+  // its weights pinned at the cap, shaving exactly the peaked weights that
+  // let rare tokens surface. Distribution shaping is the KAN's job, not
+  // the clip's: the clip stays neutral hygiene on the attention
+  // projections, and the embedding / FFN / output head learn unconstrained.
+  // Set True to restore the old network-wide clip.
+  csClipContentLayers: boolean = false;
 
   // Looser threshold for Q/K/V projection layers in attention blocks.
   // Attention dot products scale as Q*K, so capping Q/K at the same
@@ -109,6 +125,14 @@ const
   // is a corrective response, stopping is a termination response.
   csHeadDoubleWindow: integer = 2;
 
+  // ReduceLROnPlateau: when validation loss fails to beat its best for
+  // csLRPatience consecutive epochs, multiply the learning rate by csLRFactor,
+  // down to a floor of csLRFloorFraction * the initial rate. Targets the
+  // noisy-constant-LR failure mode; fully independent of the weight clip.
+  csLRPatience: integer = 1;
+  csLRFactor: TNeuralFloat = 0.7;
+  csLRFloorFraction: TNeuralFloat = 0.01;
+
 type
   // Snapshot of a layer's weight distribution at one moment in time.
   // Returned by ComputeLayerWeightStats; consumed by the adaptive
@@ -138,6 +162,29 @@ type
     FDataset: TKANTransformerDataset;
     FNFit: TNeuralDataLoadingFit;
     FSampler: TNNetSamplerBase;
+
+    // Memory-mapped training source + async prefetch -- the "load once, work
+    // downstream" experiment. FUseMmapTraining routes the training hot loop
+    // through the mmap loader; FUsePrefetch additionally decouples sample prep
+    // onto a background loader thread. Validation/test stay on the eager
+    // FDataset. Both default on; flip them (and MaxThreadNum) for the A/B.
+    FMapped: TMappedTextDataset;
+    FPrefetcher: TPrefetcher;
+    FUseMmapTraining: boolean;
+    FUsePrefetch: boolean;
+
+    // Companion-file state -- the trainer is authoritative for what a checkpoint
+    // is. At Train start it captures the context the network was actually built
+    // at and hashes the corpus once (the corpus does not change mid-run); on
+    // every epoch, after the framework has saved the .nn, OnAfterEpoch writes
+    // the companion describing that just-saved checkpoint. Inference only reads.
+    FCompContextSize: integer;
+    FCompCorpusMD5: string;
+
+    // ReduceLROnPlateau state (initialised in Train).
+    FAdaptiveLR: TNeuralFloat;
+    FLRStaleEpochs: integer;
+    FLRBestLoss: TNeuralFloat;
     // Plateau-based early stopping: track best ValidationLoss and the
     // epoch it was achieved. If FPlateauWindow epochs pass without a
     // new record, the run is treated as converged and ShouldQuit is
@@ -179,6 +226,18 @@ type
     /// log a single summary line. Invoked from OnAfterEpoch when the
     /// head-double plateau condition fires.
     procedure MaybeDoubleAllActiveHeads;
+    /// Training hot-loop getter. Routes to the prefetcher, the direct mmap
+    /// loader, or the eager dataset depending on the FUse* flags.
+    procedure GetTrainingPairRouted(Idx, ThreadId: integer;
+      pInput, pOutput: TNNetVolume);
+    /// Deterministic-by-Idx validation/test getter, served from the single
+    /// mmap source. Used for FitLoading val+test, CalibrateAlpha, and eval.
+    procedure GetValidationPairRouted(Idx, ThreadId: integer;
+      pInput, pOutput: TNNetVolume);
+    /// ReduceLROnPlateau callback: returns the current adaptive learning rate
+    /// (lowered by OnAfterEpoch when validation stalls). Assigned to the fit's
+    /// CustomLearningRateScheduleObjFn.
+    function LRSchedule(Epoch: integer): single;
   public
     constructor Create(ANN: TKANNet; ADataset: TKANTransformerDataset);
     destructor Destroy; override;
@@ -187,12 +246,32 @@ type
     // Engage the KAN attention path on the trained (or weight-loaded)
     // network and generate the canonical prompt set with baseline alpha.
     procedure LockAndGenerate;
-    // Run continuous EMA-driven calibration of SharpenAlpha against
-    // validation cross-entropy, then re-generate. Must be called after
+    // Generate the canonical prompt set at a FIXED SharpenAlpha (Option 3:
+    // per-pass finite-difference calibration is disabled -- alpha only steers
+    // the Phase-D NLMS target, never a single pass's output, so it cannot be
+    // tuned by a one-pass finite difference). Call repeatedly with different
+    // alphas to sweep within one locked run. Must be called after
     // LockAndGenerate (or after FNN is otherwise in inference mode).
-    procedure CalibrateAndGenerate(ValidationCount: integer);
+    procedure GenerateAtAlpha(const AAlpha: TNeuralFloat);
+    /// Teacher-forced, frequency-stratified next-char NLL on held-out data,
+    /// no sampler involved. Run on the SAME checkpoint in both modes (KAN
+    /// disabled = softmax baseline, vs KAN engaged+warmed) and compare the
+    /// 'rare' third -- the sampler-free measurement of whether KAN puts more
+    /// probability mass on rare-but-correct tokens. Scores whatever mode the
+    /// network is currently in; the caller sets the mode.
+    procedure EvaluateStratifiedNLL(const SampleCount: integer);
     property PlateauWindow: integer
       read FPlateauWindow write FPlateauWindow;
+    // Route training through the mmap loader (default true). When false, the
+    // eager FDataset.GetTrainingPair is used -- the baseline arm of the A/B.
+    property UseMmapTraining: boolean
+      read FUseMmapTraining write FUseMmapTraining;
+    // Decouple sample prep onto a background loader thread (default true).
+    // With this on, the page faults live in the loader, so keep compute
+    // threads at core count. With it off (workers read the mmap directly),
+    // the workers fault -- that's the over-subscribe-the-workers arm.
+    property UsePrefetch: boolean
+      read FUsePrefetch write FUsePrefetch;
   end;
 
 implementation
@@ -384,6 +463,17 @@ begin
   FBestLossEpoch := 0;
   FPlateauWindow := 10;
 
+  // One persistent memory-mapped data source for the whole session lifetime
+  // -- training (random), validation, and test all read from this single
+  // mapping, so the corpus is resident exactly once (~2 GB, not ~4 GB). Built
+  // here (not in Train) so post-training eval/calibration still have data.
+  FMapped := TMappedTextDataset.Create(FNN.GetFirstLayer().Output.SizeX);
+  FMapped.LoadDataset(FDataset.FileName);
+  FMapped.BindNetwork(FNN);
+  FPrefetcher := nil;
+  FUseMmapTraining := true;
+  FUsePrefetch := true;
+
   FQKClipMax := csQKWeightClipMax;
   FMigrationCapEnabled := false;
   FHeadDoubleBestLoss := 1e30;
@@ -396,9 +486,45 @@ end;
 
 destructor TKANTransformerSession.Destroy;
 begin
+  // Defensive: Train frees these in its finally block, but tear them down
+  // here too in case Train was never called or raised before cleanup.
+  if Assigned(FPrefetcher) then
+  begin
+    FPrefetcher.Stop;
+    FreeAndNil(FPrefetcher);
+  end;
+  FreeAndNil(FMapped);
   FSampler.Free;
   FNFit.Free;
   inherited Destroy;
+end;
+
+procedure TKANTransformerSession.GetTrainingPairRouted(Idx, ThreadId: integer;
+  pInput, pOutput: TNNetVolume);
+begin
+  // With prefetch on, pop a sample the background loader already built from
+  // the mmap (workers stay CPU-bound, faults live in the loader). With it
+  // off but mmap on, read the mapping directly (workers fault -- the
+  // oversubscription-hiding arm). Otherwise fall back to the eager dataset.
+  // Prefetch on: pop a sample the loader already built from the mmap. Off:
+  // read the mapping directly (workers fault -- the oversubscription arm).
+  if FUsePrefetch and Assigned(FPrefetcher) then
+    FPrefetcher.GetPair(pInput, pOutput)
+  else
+    FMapped.BuildTrainingSample(pInput, pOutput);
+end;
+
+procedure TKANTransformerSession.GetValidationPairRouted(Idx, ThreadId: integer;
+  pInput, pOutput: TNNetVolume);
+begin
+  FMapped.BuildValidationSample(Idx, pInput, pOutput);
+end;
+
+function TKANTransformerSession.LRSchedule(Epoch: integer): single;
+begin
+  // OnAfterEpoch lowers FAdaptiveLR on stalled validation; this just hands the
+  // framework the current value each epoch.
+  Result := FAdaptiveLR;
 end;
 
 procedure TKANTransformerSession.Train(TrainingCount, ValidationCount,
@@ -417,17 +543,51 @@ begin
   FNFit.MaxThreadNum := csTrainingThreadCount;
   FNFit.OnAfterEpoch := OnAfterEpoch;
   FNFit.OnAfterStep := OnAfterStep;
-  FNFit.FitLoading(
-    FNN,
-    TrainingCount,
-    ValidationCount,
-    TestCount,
-    BatchSize,
-    Epochs,
-    FDataset.GetTrainingPair,
-    FDataset.GetValidationPair,
-    FDataset.GetTestPair
-  );
+
+  // ReduceLROnPlateau: drive the LR from FAdaptiveLR, which OnAfterEpoch lowers
+  // when validation stalls. Starts at the configured initial rate.
+  FAdaptiveLR := FNFit.InitialLearningRate;
+  FLRStaleEpochs := 0;
+  FLRBestLoss := 1e30;
+  FNFit.CustomLearningRateScheduleObjFn := LRSchedule;
+
+  // Trainer-authoritative companion setup. Capture the context the network was
+  // actually built at (its input layer's X size) and hash the corpus once;
+  // both are reused when OnAfterEpoch writes the companion after each save.
+  FCompContextSize := FNN.GetFirstLayer().Output.SizeX;
+  // Corpus hash = the dataset's chained HMAC-MD5 over the raw lines, computed
+  // during LoadDataset (already run before Train) -- not a plain file MD5.
+  FCompCorpusMD5 := FDataset.CorpusHash;
+  WriteLn(Format('  Companion: context=%d, corpus hash=%s',
+    [FCompContextSize, FCompCorpusMD5]));
+
+  // Spin up the prefetch loader over the persistent single mmap source
+  // (created in the constructor). FMapped is not Train-scoped any more.
+  if FUseMmapTraining and FUsePrefetch then
+  begin
+    FPrefetcher := TPrefetcher.Create(FMapped.BuildTrainingSample);
+    FPrefetcher.Start;
+  end;
+
+  try
+    FNFit.FitLoading(
+      FNN,
+      TrainingCount,
+      ValidationCount,
+      TestCount,
+      BatchSize,
+      Epochs,
+      GetTrainingPairRouted,
+      GetValidationPairRouted,
+      GetValidationPairRouted
+    );
+  finally
+    if Assigned(FPrefetcher) then
+    begin
+      FPrefetcher.Stop;
+      FreeAndNil(FPrefetcher);
+    end;
+  end;
   FNN.DebugWeights;
 end;
 
@@ -439,7 +599,14 @@ begin
   // passthrough to its B-spline normaliser. LockToInference is one-way --
   // no further training is permitted on FNN.
   FNN.LockToInference;
-  WriteLn('--- KAN attention engaged; post-training generation (baseline alpha=1.1): ---');
+  WriteLn(Format('--- KAN attention engaged; post-training generation (alpha=%.3f): ---',
+    [FNN.GetCurrentAlpha]));
+  // Telemetry right after lock. Every head should read ksSoftmaxActive
+  // (Phase M / mimicry) here: handover to Phase D (ksKANActive) only fires
+  // once enough inference passes drive KLEMA below threshold. This is the
+  // baseline -- the "did the KAN actually take over?" reference point.
+  WriteLn('--- KAN state immediately after lock ---');
+  Write(FNN.KANTelemetry);
   // Inference-mode Compute mutates FHead.Coeffs on every forward pass
   // (NLMS Phase M/D, see TNNetKANNormaliser.Compute step 7). Snapshot
   // around generation so the loaded checkpoint is left untouched after
@@ -450,29 +617,41 @@ begin
   finally
     FNN.RestoreAllCoeffs(Snapshot);
   end;
+  // Coeffs were rolled back, but Status/KLEMA are not part of the coeff
+  // snapshot, so this reflects whatever handover / KL movement the generation
+  // passes drove. If status still reads all-SM, the KAN never left mimicry
+  // and SharpenAlpha is inert by construction for this checkpoint.
+  WriteLn('--- KAN state after baseline generation ---');
+  Write(FNN.KANTelemetry);
 end;
 
-procedure TKANTransformerSession.CalibrateAndGenerate(ValidationCount: integer);
+procedure TKANTransformerSession.GenerateAtAlpha(const AAlpha: TNeuralFloat);
 var
   Snapshot: TKANCoeffSnapshot;
 begin
-  WriteLn('--- Calibrating SharpenAlpha against validation loss ---');
-  // CalibrateAlpha defaults to PreserveCoeffs=true + UseBestAlpha=true:
-  // only the SharpenAlpha hyperparameter persists from the sweep, and
-  // the alpha selected is the one with the lowest observed validation
-  // loss across iterations.
-  FNN.CalibrateAlpha(FDataset.GetValidationPair, ValidationCount);
-  WriteLn('--- Post-calibration generation: ---');
-  // Same non-destructive pattern as LockAndGenerate: the post-cal
-  // generation samples must not drift coefficients either, otherwise a
-  // subsequent inspection (or a re-run of CalibrateAndGenerate) would
-  // see a network that differs from the calibrated state.
+  // Option 3: no per-pass calibration. SharpenAlpha only sets the Phase-D
+  // NLMS *target* (the sharpened self-distillation distribution), so it
+  // influences future passes through slow coefficient adaptation, never the
+  // current pass's output -- a one-pass finite difference measures ~zero
+  // gradient and cannot tune it. We therefore set a fixed alpha and generate;
+  // sweep alpha by calling this again with another value (the network stays
+  // locked) or across separate runs.
+  WriteLn(Format('--- Fixed SharpenAlpha = %.3f (per-pass calibration disabled) ---',
+    [AAlpha]));
+  FNN.SetAllAlpha(AAlpha);
+  WriteLn('--- KAN state before fixed-alpha generation ---');
+  Write(FNN.KANTelemetry);
+  // Non-destructive read: roll coefficients back after generation so a
+  // subsequent GenerateAtAlpha (a different sweep point) starts from the same
+  // post-lock state rather than this run's drift.
   Snapshot := FNN.SnapshotAllCoeffs;
   try
     GenerateSamples;
   finally
     FNN.RestoreAllCoeffs(Snapshot);
   end;
+  WriteLn('--- KAN state after fixed-alpha generation ---');
+  Write(FNN.KANTelemetry);
 end;
 
 procedure TKANTransformerSession.GenerateSamples;
@@ -524,6 +703,7 @@ var
   MinAcc, MaxAcc, Oscillation: TNeuralFloat;
   AnyHomogenizationMatch, AnySaturationMatch: boolean;
   Stats: TLayerWeightStats;
+  Companion: TCheckpointCompanion;
 begin
   GenerateSamples;
 
@@ -531,6 +711,21 @@ begin
   // populates ValidationLoss / CurrentEpoch); skip otherwise.
   if Sender = FNFit then
   begin
+    // Trainer-authoritative companion. OnAfterEpoch runs AFTER the framework
+    // saves the .nn (the save precedes this callback), so the file on disk is
+    // the just-saved checkpoint. (Re)write its companion -- context + the
+    // once-hashed corpus MD5 + the .nn's current MD5 -- so it always describes
+    // the checkpoint as saved. Skipped until a .nn exists.
+    if FileExists(FNFit.FileNameBase + '.nn') then
+    begin
+      Companion := TCheckpointCompanion.Create(FNFit.FileNameBase + '.nn');
+      try
+        Companion.Write(FCompContextSize, FCompCorpusMD5);
+      finally
+        Companion.Free;
+      end;
+    end;
+
     if FNFit.ValidationLoss < FBestLoss then
     begin
       FBestLoss := FNFit.ValidationLoss;
@@ -542,6 +737,34 @@ begin
         'Plateau: no ValidationLoss improvement for %d epochs (best %.4f at epoch %d). Stopping.',
         [FPlateauWindow, FBestLoss, FBestLossEpoch]));
       FNFit.ShouldQuit := true;
+    end;
+
+    // ReduceLROnPlateau: independent of the stop / head-double plateaus. When
+    // validation fails to beat its best for csLRPatience epochs, scale the
+    // adaptive LR down (to the floor) and reset the counter. OnAfterEpoch runs
+    // at epoch end; LRSchedule hands the new value to the next epoch.
+    if FNFit.ValidationLoss < FLRBestLoss then
+    begin
+      FLRBestLoss := FNFit.ValidationLoss;
+      FLRStaleEpochs := 0;
+    end
+    else
+    begin
+      Inc(FLRStaleEpochs);
+      if FLRStaleEpochs >= csLRPatience then
+      begin
+        if FAdaptiveLR * csLRFactor >=
+           FNFit.InitialLearningRate * csLRFloorFraction then
+        begin
+          FAdaptiveLR := FAdaptiveLR * csLRFactor;
+          WriteLn(Format(
+            '[Adaptive] ValidationLoss stalled %d epoch(s); learning rate -> %.6f',
+            [FLRStaleEpochs, FAdaptiveLR]));
+        end
+        else
+          WriteLn('[Adaptive] ValidationLoss stalled but LR at floor; holding.');
+        FLRStaleEpochs := 0;
+      end;
     end;
 
     // Plateau-triggered head doubling. Tracked on a separate, shorter
@@ -669,9 +892,16 @@ begin
       Layer := FNN.Layers[LayerIdx];
       if Layer.Neurons.Count = 0 then continue;
       IsQKVLayer := QKVLayers.IndexOf(Layer) >= 0;
-      if IsQKVLayer
-        then ClipMax := FQKClipMax
-        else ClipMax := csWeightClipMax;
+      // Attention projections always clip (at the looser Q/K/V cap, where
+      // it acts as a dormant guardrail). The content path clips only when
+      // csClipContentLayers is set -- by default it learns unconstrained,
+      // so the embedding stops leaking and the vocab head stops pinning.
+      if IsQKVLayer then
+        ClipMax := FQKClipMax
+      else if csClipContentLayers then
+        ClipMax := csWeightClipMax
+      else
+        continue;
       for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
         ClipAndSpreadWeights(Layer.Neurons[NeuronIdx].Weights, ClipMax,
           FMigrationCapEnabled);
@@ -752,6 +982,92 @@ begin
     end;
   finally
     QKVLayers.Free;
+  end;
+end;
+
+procedure TKANTransformerSession.EvaluateStratifiedNLL(const SampleCount: integer);
+// Teacher-forced, frequency-stratified next-char NLL over held-out validation
+// samples -- no sampler. For each sample it reads the probability the model
+// assigns to the TRUE next char, accumulates -ln() per char, then buckets the
+// vocab by how often each char actually occurs (common / mid / rare third of
+// the observed token mass) and reports mean NLL per bucket. Run twice on the
+// SAME checkpoint -- once KAN-disabled (softmax baseline), once KAN-engaged --
+// and compare the 'rare' third: that is the sampler-free "does KAN put more
+// mass on rare-but-correct tokens" measurement. NOTE: in KAN mode each Compute
+// mutates the spline state, so the caller should SnapshotAllCoeffs before /
+// RestoreAllCoeffs after for a non-destructive read.
+var
+  InputVol, OutputVol: TNNetVolume;
+  V, I, J, Tok, B, tmp: integer;
+  Prob, NLLv: TNeuralFloat;
+  SumNLL: array of Double;
+  Cnt: array of Int64;
+  Order: array of integer;
+  BSumNLL: array[0..2] of Double;
+  BCnt: array[0..2] of Int64;
+  TotalCnt, RunCnt: Int64;
+  LastLayer: TNNetLayer;
+const
+  QFloor = 1e-30;
+  BucketName: array[0..2] of string = ('common', 'mid', 'rare');
+begin
+  V := FNN.GetLastLayer.Output.Size;          // vocab size (softmax width)
+  SetLength(SumNLL, V);
+  SetLength(Cnt, V);
+  SetLength(Order, V);
+  for I := 0 to V - 1 do begin SumNLL[I] := 0; Cnt[I] := 0; Order[I] := I; end;
+
+  InputVol := TNNetVolume.Create;
+  OutputVol := TNNetVolume.Create;
+  try
+    LastLayer := FNN.GetLastLayer;
+    for I := 0 to SampleCount - 1 do
+    begin
+      FMapped.BuildValidationSample(I, InputVol, OutputVol);
+      Tok := OutputVol.Tag;                    // true next-char index
+      if (Tok < 0) or (Tok >= V) then Continue;
+      FNN.Compute(InputVol);
+      Prob := LastLayer.Output.FData[Tok];
+      if Prob < QFloor then Prob := QFloor;
+      NLLv := -Ln(Prob);
+      SumNLL[Tok] := SumNLL[Tok] + NLLv;
+      Cnt[Tok] := Cnt[Tok] + 1;
+    end;
+
+    // Rank chars by observed frequency, descending. V<=128, O(n^2) is fine.
+    for I := 0 to V - 2 do
+      for J := I + 1 to V - 1 do
+        if Cnt[Order[J]] > Cnt[Order[I]] then
+        begin tmp := Order[I]; Order[I] := Order[J]; Order[J] := tmp; end;
+
+    TotalCnt := 0;
+    for I := 0 to V - 1 do TotalCnt := TotalCnt + Cnt[I];
+
+    // Walk common -> rare, splitting the observed token mass into thirds.
+    for B := 0 to 2 do begin BSumNLL[B] := 0; BCnt[B] := 0; end;
+    RunCnt := 0;
+    for I := 0 to V - 1 do
+    begin
+      Tok := Order[I];
+      if Cnt[Tok] = 0 then Continue;
+      if RunCnt < TotalCnt div 3 then B := 0
+      else if RunCnt < (2 * TotalCnt) div 3 then B := 1
+      else B := 2;
+      BSumNLL[B] := BSumNLL[B] + SumNLL[Tok];
+      BCnt[B] := BCnt[B] + Cnt[Tok];
+      RunCnt := RunCnt + Cnt[Tok];
+    end;
+
+    WriteLn(Format('Stratified NLL over %d samples (%d scored tokens):',
+      [SampleCount, TotalCnt]));
+    for B := 0 to 2 do
+      if BCnt[B] > 0 then
+        WriteLn(Format('  %-6s third: mean NLL = %.4f  (%d tokens)',
+          [BucketName[B], BSumNLL[B] / BCnt[B], BCnt[B]]));
+    Flush(Output);
+  finally
+    InputVol.Free;
+    OutputVol.Free;
   end;
 end;
 

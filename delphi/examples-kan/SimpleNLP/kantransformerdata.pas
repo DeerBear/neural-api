@@ -18,7 +18,7 @@ three, and visible progress so the user can see it's alive.
 interface
 
 uses
-  Classes, SysUtils, Math,
+  Classes, SysUtils, Math, System.Hash,
   neuralvolume, neuralnetwork;
 
 const
@@ -29,6 +29,7 @@ type
   private
     FDataset: TStringList;
     FDatasetSize: integer;
+    FKeptCount: integer;
     FFileName: string;
     FNN: TNNet;
     FMaxPredictCharPos: integer;
@@ -41,6 +42,12 @@ type
     FLogSum, FLogSumSq: double;
     FLogLogSum, FLogLogSumSq: double;
     FMinLen, FMaxLen: integer;
+    // Corpus integrity hash, computed during LoadDataset: a chained HMAC-MD5
+    // over every raw line in file order -- the first line seeds the byte
+    // accumulator, the middle lines key the byte-chain, and the last line keys
+    // the final call that renders the hex string. Same construction on every
+    // load, so trainer and inference reproduce the identical value.
+    FCorpusHash: string;
     function GetMeanLen: double;
     function GetMeanLogLen: double;
     function GetStdLogLen: double;
@@ -62,6 +69,9 @@ type
     procedure GetTestPair(Idx: integer; ThreadId: integer;
       pInput, pOutput: TNNetVolume);
     property DatasetSize: integer read FDatasetSize;
+    // Source file path, so a memory-mapped training source can be built from
+    // the same corpus the eager loader read.
+    property FileName: string read FFileName;
     // Curriculum window for training samples: pair-getter caps the sample
     // length by this value. OnAfterEpoch typically grows/shrinks this in
     // response to training accuracy.
@@ -84,6 +94,9 @@ type
     // Data-driven context size from the log-log mean. Use this as the
     // input to BuildKANTransformer1M unless overridden.
     property RecommendedContextLen: integer read GetRecommendedContextLen;
+    // Chained HMAC-MD5 over the raw corpus lines (see FCorpusHash). Valid after
+    // LoadDataset; '' for an empty corpus.
+    property CorpusHash: string read FCorpusHash;
   end;
 
 implementation
@@ -96,6 +109,7 @@ begin
   FContextLen := AContextLen;
   FDataset := TStringList.Create;
   FDatasetSize := 0;
+  FKeptCount := 0;
   FMaxPredictCharPos := AContextLen;
   FNN := nil;
   FLengthSum := 0;
@@ -106,6 +120,7 @@ begin
   FLogLogSumSq := 0;
   FMinLen := MaxInt;
   FMaxLen := 0;
+  FCorpusHash := '';
 end;
 
 destructor TKANTransformerDataset.Destroy;
@@ -120,6 +135,10 @@ var
   Line: string;
   LineNum, LineLen: integer;
   LogLen, LogLogLen: double;
+  // Corpus-hash chain state (every raw line, in file order).
+  HashBytes: TBytes;
+  PrevLine: string;
+  HasFirst, HasPrev: boolean;
 begin
   WriteLn('Streaming dataset from ', FFileName, '...');
   Flush(Output);
@@ -130,13 +149,41 @@ begin
   Reader := TStreamReader.Create(FFileName, TEncoding.UTF8);
   try
     LineNum := 0;
+    HasFirst := False;
+    HasPrev := False;
+    HashBytes := nil;
+    PrevLine := '';
     while not Reader.EndOfStream do
     begin
       Line := Reader.ReadLine;
+
+      // Corpus-hash chain over EVERY raw line (before any filtering or
+      // processing), in file order. The first line seeds the byte accumulator;
+      // each later line is applied as an HMAC-MD5 key over the running bytes,
+      // deferred by one read so the LAST line is never byte-keyed -- it keys
+      // the final string call after the loop instead.
+      if not HasFirst then
+      begin
+        HashBytes := TEncoding.UTF8.GetBytes(Line);
+        HasFirst := True;
+      end
+      else
+      begin
+        if HasPrev then
+          HashBytes := THashMD5.GetHMACAsBytes(HashBytes,
+            TEncoding.UTF8.GetBytes(PrevLine));
+        PrevLine := Line;
+        HasPrev := True;
+      end;
+
       LineLen := Length(Line);
       if LineLen >= csMinSampleSize then
       begin
-        FDataset.Add(LowerCase(Line) + chr(1));
+        // Line-less: count + accumulate length stats only. Samples are served
+        // from the single mmap source, so we no longer hold the ~2 GB corpus
+        // in a TStringList -- this pass exists only for RecommendedContextLen
+        // and the distribution print.
+        Inc(FKeptCount);
         // Distribution accumulators -- raw, single-log, double-log.
         // Guard the double-log: Ln(Ln(x)) requires Ln(x) > 0, so x > e
         // (~2.72). csMinSampleSize=3 satisfies this, but the guard
@@ -158,14 +205,27 @@ begin
       Inc(LineNum);
       if (LineNum mod 100000) = 0 then
       begin
-        WriteLn('  read ', LineNum, ' lines, kept ', FDataset.Count);
+        WriteLn('  read ', LineNum, ' lines, kept ', FKeptCount);
         Flush(Output);
       end;
     end;
   finally
     Reader.Free;
   end;
-  FDatasetSize := FDataset.Count;
+
+  // Finalize the corpus hash: the last line read keys the extra HMAC call that
+  // renders the running bytes as the hex string. Single-line corpus: that line
+  // is its own final key. Empty corpus: ''.
+  if not HasFirst then
+    FCorpusHash := ''
+  else
+  begin
+    if not HasPrev then PrevLine := Line;
+    FCorpusHash := THash.DigestAsString(
+      THashMD5.GetHMACAsBytes(HashBytes, TEncoding.UTF8.GetBytes(PrevLine)));
+  end;
+
+  FDatasetSize := FKeptCount;
   WriteLn('Loaded dataset with ', FDatasetSize, ' rows');
   if FDatasetSize > 0 then
   begin
